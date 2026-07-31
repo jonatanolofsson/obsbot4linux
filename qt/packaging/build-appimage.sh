@@ -68,10 +68,22 @@ cmake -S "$QT_DIR" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
 cmake --build "$BUILD" -j
 DESTDIR="$APPDIR" cmake --install "$BUILD" --prefix /usr
 
-# --- bundle the OBSBOT SDK (.so + SONAME symlink) ---------------------------
+# --- bundle the OBSBOT SDK --------------------------------------------------
+# Bundle the library the binary actually asks for: the SONAME of the .so CMake
+# linked against. Hardcoding a version silently ships the wrong one when the SDK
+# carries more than one — libdev_v2.1.0_8 contains both libdev.so.1.0.0 and
+# libdev.so.1.0.3, its libdev.so has SONAME libdev.so.1.0.0, and the old
+# hardcoded copy therefore added a ~25 MB library the app never loads on top of
+# the one linuxdeploy had already deployed from the binary's NEEDED entry.
 mkdir -p "$APPDIR/usr/lib"
-cp -av "$SDK_LIB/libdev.so.1.0.3" "$APPDIR/usr/lib/"
-ln -sf libdev.so.1.0.3 "$APPDIR/usr/lib/libdev.so.1"
+SDK_SONAME=$(readelf -d "$SDK_LIB/libdev.so" 2>/dev/null |
+             sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p' | head -1)
+if [ -z "$SDK_SONAME" ] || [ ! -f "$SDK_LIB/$SDK_SONAME" ]; then
+    echo "error: could not determine the libdev SONAME from $SDK_LIB/libdev.so" >&2
+    exit 1
+fi
+echo ">> bundling SDK: $SDK_SONAME"
+cp -av "$SDK_LIB/$SDK_SONAME" "$APPDIR/usr/lib/"
 
 # --- Qt plugin config: scan our QML so the right modules are bundled --------
 export QML_SOURCES_PATHS="$QT_DIR/qml"
