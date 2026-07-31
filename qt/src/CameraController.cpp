@@ -36,6 +36,14 @@ constexpr qint64 kAiDisengageHintMs = 20000;
 // via its result and this only fires if one is never answered.
 constexpr int kMicPairCueMaxMs = 12000;    // clear: the camera answers on its own
 constexpr int kMicPairWaitMaxMs = 90000;   // pair: long enough to fetch the mic and hold its button
+// Give-up window for an in-flight audio source / pickup-pattern pick. Their only
+// readback is the status push, so this must outlast one push cycle (2–3 s) plus
+// the pulse the worker opens in low-traffic mode. When it fires, the optimistic
+// value is dropped and the device's own value drives the selector again.
+constexpr int kAudioConfirmMs = 6000;
+// Default noise-reduction strength used when the user turns NR on before the
+// camera has ever reported a level (documented range [1-10]; 5 = middle).
+constexpr int kAudioNoiseLevelDefault = 5;
 } // namespace
 
 CameraController::CameraController(QObject *parent) : QObject(parent) {
@@ -69,6 +77,32 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
         }
     });
 
+    // Same net again for the audio source / pickup-pattern selectors. Their only
+    // readback is the status push, so an ignored command would otherwise leave
+    // the segment showing a choice the camera never made.
+    m_audioSourceTimer = new QTimer(this);
+    m_audioSourceTimer->setSingleShot(true);
+    m_audioSourceTimer->setInterval(kAudioConfirmMs);
+    connect(m_audioSourceTimer, &QTimer::timeout, this, [this]() {
+        if (m_audioSourceTarget >= 0) {
+            emit logLine("warn", QStringLiteral("audio source: the camera did not report the new source — "
+                                                "showing what it actually reports again"));
+            m_audioSourceTarget = -1;
+            emit audioChanged();
+        }
+    });
+    m_audioModeTimer = new QTimer(this);
+    m_audioModeTimer->setSingleShot(true);
+    m_audioModeTimer->setInterval(kAudioConfirmMs);
+    connect(m_audioModeTimer, &QTimer::timeout, this, [this]() {
+        if (m_audioModeTarget >= 0) {
+            emit logLine("warn", QStringLiteral("audio pickup: the camera did not report the new pattern — "
+                                                "showing what it actually reports again"));
+            m_audioModeTarget = -1;
+            emit audioChanged();
+        }
+    });
+
     m_worker = new CameraWorker;   // no parent: it will live on m_thread
     m_worker->moveToThread(&m_thread);
     connect(&m_thread, &QThread::started, m_worker, &CameraWorker::init);
@@ -87,6 +121,7 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     connect(m_worker, &CameraWorker::micStatus, this, &CameraController::onMicStatus);
     connect(m_worker, &CameraWorker::twsInfo, this, &CameraController::onTwsInfo);
     connect(m_worker, &CameraWorker::micAudioSelect, this, &CameraController::onMicAudioSelect);
+    connect(m_worker, &CameraWorker::audioState, this, &CameraController::onAudioState);
 
     m_thread.start();
 }
@@ -217,6 +252,43 @@ QString CameraController::micButtonActionName() const {
     return m_micButtonDevice < 0 ? QStringLiteral("—") : micButtonName(m_micButtonDevice);
 }
 
+// Device::DevAudioSourceType, spelled the way the page talks about it. The
+// camera reports a wireless Vox SE as Bluetooth(3) — it has no separate
+// "2.4 GHz mic" source — so that is what gets named here.
+static QString audioSourceLabel(int src) {
+    switch (src) {
+    case 0:  return QStringLiteral("built-in mic array");
+    case 1:  return QStringLiteral("aux line in");
+    case 2:  return QStringLiteral("aux mic in");
+    case 3:  return QStringLiteral("wireless mic (Vox SE)");
+    case 4:  return QStringLiteral("USB-C audio");
+    default: return QStringLiteral("source %1").arg(src);   // honest, never blank
+    }
+}
+
+// Device::AudioModeType, using the header's own descriptions.
+static QString audioModeLabel(int mode) {
+    switch (mode) {
+    case 0:  return QStringLiteral("Omnidirectional");
+    case 1:  return QStringLiteral("Stereo");
+    case 2:  return QStringLiteral("Forward pointing");
+    case 3:  return QStringLiteral("Backward pointing");
+    case 4:  return QStringLiteral("Forward and backward");
+    case 5:  return QStringLiteral("Music");
+    default: return QStringLiteral("pattern %1").arg(mode);
+    }
+}
+
+// Deliberately built from the DEVICE value, never the optimistic one: this is
+// the "what the camera actually reports" row next to the selector.
+QString CameraController::audioSourceName() const {
+    return m_audioSourceDevice < 0 ? QStringLiteral("—") : audioSourceLabel(m_audioSourceDevice);
+}
+
+QString CameraController::audioModeName() const {
+    return m_audioModeDevice < 0 ? QStringLiteral("—") : audioModeLabel(m_audioModeDevice);
+}
+
 void CameraController::persist() {
     if (!Settings::save(m_settings))
         emit logLine("warn", QStringLiteral("settings: failed to write %1").arg(Settings::configPath()));
@@ -295,6 +367,100 @@ void CameraController::setMicButtonAction(int idx) {
     emit micChanged();
     QMetaObject::invokeMethod(m_worker, "cmdSetMicButtonAction", Qt::QueuedConnection,
                               Q_ARG(int, idx));
+}
+
+// ---------------------------------------------------------------------------
+// The camera's own microphone (Tiny 3 mic array)
+//
+// None of this is persisted: the CAMERA owns every one of these settings and
+// reports them back, so there is exactly one source of truth and no app-side
+// copy to drift out of sync. Nothing is re-sent on connect either — one command
+// per user action, per the AI-fault finding (a rapid burst of audio/AI/sleep
+// writes put a Tiny 3 into a solid-red-LED fault where it ignored everything).
+//
+// Volume / mute / noise reduction / AGC answer their own getters immediately, so
+// they have no optimistic override: the worker re-reads right after the set and
+// the readback drives the UI. Source and pickup pattern have NO getter — their
+// only readback is the status push — so those two carry the optimistic
+// in-flight value with a give-up timer.
+// ---------------------------------------------------------------------------
+bool CameraController::audioReady(const QString &what) {
+    if (connected() && m_capAudio) return true;
+    emit logLine("warn", what + QStringLiteral(": the camera does not expose the audio API"));
+    return false;
+}
+
+void CameraController::setAudioVolume(int volume) {
+    if (!audioReady(QStringLiteral("audio volume"))) return;
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioVolume", Qt::QueuedConnection,
+                              Q_ARG(int, volume < 0 ? 0 : (volume > 100 ? 100 : volume)));
+}
+
+void CameraController::setAudioMute(bool muted) {
+    if (!audioReady(QStringLiteral("audio mute"))) return;
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioMute", Qt::QueuedConnection, Q_ARG(bool, muted));
+}
+
+// The SDK writes on/off and strength together, so each half of the UI sends the
+// pair — keeping whatever the camera last reported for the other half. Before
+// the camera has ever reported a level, use the middle of the documented range
+// rather than 0, which is outside it.
+void CameraController::setAudioNoiseReduce(bool on) {
+    if (!audioReady(QStringLiteral("audio noise reduction"))) return;
+    const int level = m_audioNoiseLevel > 0 ? m_audioNoiseLevel : kAudioNoiseLevelDefault;
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioNoiseReduce", Qt::QueuedConnection,
+                              Q_ARG(bool, on), Q_ARG(int, level));
+}
+
+void CameraController::setAudioNoiseLevel(int level) {
+    if (!audioReady(QStringLiteral("audio noise reduction"))) return;
+    // Changing the strength must not silently switch noise reduction ON — if the
+    // camera says it is off, the level is written but the state is preserved.
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioNoiseReduce", Qt::QueuedConnection,
+                              Q_ARG(bool, m_audioNoiseReduce == 1),
+                              Q_ARG(int, level < 1 ? 1 : (level > 10 ? 10 : level)));
+}
+
+void CameraController::setAudioAgc(bool on) {
+    if (!audioReady(QStringLiteral("audio agc"))) return;
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioAgc", Qt::QueuedConnection, Q_ARG(bool, on));
+}
+
+void CameraController::setAudioMode(int mode) {
+    if (!audioReady(QStringLiteral("audio pickup"))) return;
+    if (mode < 0 || mode > 5) return;   // Device::AudioModeType 0..5 (AudioModeButt = 6)
+    // Show the pick now; the camera only confirms it on the next status push.
+    m_audioModeTarget = mode;
+    m_audioModeTimer->start();
+    emit audioChanged();
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioMode", Qt::QueuedConnection, Q_ARG(int, mode));
+}
+
+// Pinning a source turns the camera's own arbitration OFF — the worker does both
+// in one command because doing only the second half is silently undone by the
+// hardware. Reflect that here too, so the "Auto" segment lets go immediately
+// instead of staying lit next to a manual choice.
+void CameraController::setAudioSource(int source) {
+    if (!audioReady(QStringLiteral("audio source"))) return;
+    if (source < 0 || source > 4) return;   // Device::DevAudioSourceType 0..4
+    m_audioSourceTarget = source;
+    m_audioSourceTimer->start();
+    m_audioAuto = 0;   // corrected by the cameraGetAudioSelectR readback moments later
+    emit audioChanged();
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioSource", Qt::QueuedConnection, Q_ARG(int, source));
+}
+
+// Hand source selection back to the camera. No optimistic value: is_auto has a
+// real getter and the worker re-reads it straight after the set.
+void CameraController::setAudioAuto(bool on) {
+    if (!audioReady(QStringLiteral("audio auto source"))) return;
+    // A manual pick that is still in flight is now moot — the camera is about to
+    // choose for itself, so stop claiming the user's source will stick.
+    if (on && m_audioSourceTarget >= 0) {
+        m_audioSourceTarget = -1;
+        m_audioSourceTimer->stop();
+    }
+    QMetaObject::invokeMethod(m_worker, "cmdSetAudioAuto", Qt::QueuedConnection, Q_ARG(bool, on));
 }
 
 // Push the MANAGED power/sleep settings ("Device"=0 is never sent) to the
@@ -729,12 +895,28 @@ void CameraController::onDeviceLost(const QString &reason) {
     m_micButtonTarget = -1;   // a reconnect must not resurrect a stale optimistic pick
     if (m_micButtonTimer) m_micButtonTimer->stop();
     m_capMicButton = false;   // re-probed on the next bind, never assumed
+    // Built-in audio: with no device every value is unknown again (honesty), and
+    // no optimistic pick may survive into the next connection.
+    m_audioVolume = -1;
+    m_audioMuted = -1;
+    m_audioNoiseReduce = -1;
+    m_audioNoiseLevel = -1;
+    m_audioAgc = -1;
+    m_audioAuto = -1;
+    m_audioSourceDevice = -1;
+    m_audioModeDevice = -1;
+    m_audioSourceTarget = -1;
+    m_audioModeTarget = -1;
+    if (m_audioSourceTimer) m_audioSourceTimer->stop();
+    if (m_audioModeTimer) m_audioModeTimer->stop();
+    m_capAudio = false;       // re-probed on the next bind, never assumed
     emit connStateChanged();
     emit statusChanged();
     emit aiChanged();
     emit imageChanged();
     emit zoomChanged();
     emit micChanged();
+    emit audioChanged();
     emit logLine("warn", QStringLiteral("device lost: %1 — controls disabled").arg(reason));
 }
 
@@ -908,7 +1090,35 @@ void CameraController::onPresetCaptured(int idx, double pitch, double yaw, doubl
 // Presence, from the camera's own status push (tiny.wireless_mic). Authoritative
 // and free — nothing is polled for it.
 void CameraController::onMicStatus(bool tx1Online, bool tx2Online, bool twsMode,
-                                   bool pairing, bool scanning) {
+                                   bool pairing, bool scanning, int audioSource, int audioMode) {
+    // The same push also carries the camera's own audio source and pickup
+    // pattern (tiny.audio_mode), which is the ONLY readback either of them has.
+    // Handled first and separately: an audio change with no mic change must
+    // still reach the UI, and vice versa.
+    bool audioDirty = false;
+    if (audioSource != m_audioSourceDevice) {
+        m_audioSourceDevice = audioSource;
+        audioDirty = true;
+    }
+    if (audioMode != m_audioModeDevice) {
+        m_audioModeDevice = audioMode;
+        audioDirty = true;
+    }
+    // The device agreeing with our pick is what ends the optimistic window — the
+    // command's rc never was proof (with the camera's own source arbitration on,
+    // a source pick is accepted and then reverted).
+    if (m_audioSourceTarget >= 0 && m_audioSourceDevice == m_audioSourceTarget) {
+        m_audioSourceTarget = -1;
+        m_audioSourceTimer->stop();
+        audioDirty = true;
+    }
+    if (m_audioModeTarget >= 0 && m_audioModeDevice == m_audioModeTarget) {
+        m_audioModeTarget = -1;
+        m_audioModeTimer->stop();
+        audioDirty = true;
+    }
+    if (audioDirty) emit audioChanged();
+
     if (m_micTx[0].online == tx1Online && m_micTx[1].online == tx2Online
         && m_micTwsMode == twsMode && m_micPairing == pairing && m_micScanning == scanning)
         return;   // status pushes every ~2-3 s; don't churn QML bindings for nothing
@@ -975,14 +1185,45 @@ void CameraController::onTwsInfo(bool supported, int keyCmd,
     emit micChanged();
 }
 
-// has_pair_record is the "this camera has never had a mic paired" diagnostic;
-// the other two fields are informational (auto audio-source selection).
+// has_pair_record is the "this camera has never had a mic paired" diagnostic.
+// is_auto is load-bearing for the Audio section: while it is 1 the camera picks
+// the input itself and silently reverts any manual choice, so it drives the
+// "Automatic" segment and must be readable — and clearable — by the user.
+// support_auto only says whether the camera has the feature at all, which
+// capAudio and the auto readback already convey, so it stays informational.
 void CameraController::onMicAudioSelect(int hasPairRecord, int isAuto, int supportAuto) {
-    Q_UNUSED(isAuto);
     Q_UNUSED(supportAuto);
+    if (isAuto != m_audioAuto) {
+        m_audioAuto = isAuto;
+        emit audioChanged();
+    }
     if (hasPairRecord == m_micPairRecord) return;
     m_micPairRecord = hasPairRecord;
     emit micChanged();
+}
+
+// Built-in audio detail (volume / mute / noise reduction / AGC) from the
+// worker's one read pass. `supported` is the runtime capability probe — false
+// means the camera-audio API is unavailable on this build/firmware, and every
+// value must go back to "unknown" rather than showing an invented 0.
+void CameraController::onAudioState(bool supported, int volume, int muted,
+                                    int noiseReduce, int noiseLevel, int agc) {
+    m_capAudio = supported;
+    if (!supported) {
+        m_audioVolume = -1;
+        m_audioMuted = -1;
+        m_audioNoiseReduce = -1;
+        m_audioNoiseLevel = -1;
+        m_audioAgc = -1;
+        emit audioChanged();
+        return;
+    }
+    m_audioVolume = volume;
+    m_audioMuted = muted;
+    m_audioNoiseReduce = noiseReduce;
+    m_audioNoiseLevel = noiseLevel;
+    m_audioAgc = agc;
+    emit audioChanged();
 }
 
 void CameraController::scheduleStartupPreset(const QString &why) {

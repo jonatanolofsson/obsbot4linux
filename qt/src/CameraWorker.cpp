@@ -61,6 +61,19 @@ const char *productName(ObsbotProductType t) {
     }
 }
 
+// Device::DevAudioSourceType, for log lines. Bluetooth(3) is what a Vox SE
+// wireless mic shows up as — the camera has no separate "2.4 GHz mic" source.
+const char *audioSourceName(int s) {
+    switch (s) {
+    case Device::DevAudioSourceTypeBuildIn:   return "built-in mic array";
+    case Device::DevAudioSourceTypeAuxLine:   return "aux line in";
+    case Device::DevAudioSourceTypeAuxMic:    return "aux mic in";
+    case Device::DevAudioSourceTypeBluetooth: return "wireless mic";
+    case Device::DevAudioSourceTypeUsbC:      return "USB-C audio";
+    default:                                  return "unknown source";
+    }
+}
+
 const char *devModeName(Device::DevMode m) {
     switch (m) {
     case Device::DevModeUvc: return "UVC";
@@ -181,6 +194,8 @@ void CameraWorker::bindDevice(const std::shared_ptr<Device> &d) {
     m_sn = QString::fromStdString(d->devSn());
     m_twsSupported = false;   // re-probed below; never carried over from a previous device
     m_twsProbed = false;
+    m_audioSupported = false;
+    m_audioProbed = false;
 
     const QString product = productName(d->productType());
     const QString fw = QString::fromStdString(d->devVersion());
@@ -207,6 +222,11 @@ void CameraWorker::bindDevice(const std::shared_ptr<Device> &d) {
     if (m_twsSupported) m_twsInfoTimer->start();
 
     cmdReadAudioSelect();
+    // The camera's own mic array: one read pass, which is also the capability
+    // probe. Nothing is WRITTEN on connect — a rapid burst of audio/AI/sleep
+    // writes has been observed to drive the camera into an AI fault (solid red
+    // LED, everything silently ignored), so the app never "syncs all settings".
+    cmdReadAudio();
 }
 
 // ---------------------------------------------------------------------------
@@ -233,13 +253,20 @@ void CameraWorker::sdkStatusTrampoline(void *param, const void *data) {
                         | ((wm.tx_state & 0x3) << 1)
                         | (wm.is_pairing ? 1 << 3 : 0)
                         | (wm.is_scanning ? 1 << 4 : 0);
+    // The camera's OWN audio, from the neighbouring public bitfield: which input
+    // it is using (DevAudioSourceType — 3 is the wireless Vox SE) and the mic
+    // array's pickup pattern (AudioModeType). This is the READBACK for both
+    // cmdSetAudioSource and cmdSetAudioMode: neither has an exported getter, and
+    // neither command's rc is proof that the setting took.
+    const auto &am = st->tiny.audio_mode;
+    const int audioBits = (am.source & 0x7) | ((am.mode & 0x1f) << 3);
     // Do NOT touch SDK/Qt state here — just marshal onto the worker thread.
     QMetaObject::invokeMethod(
-        self, [self, run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep, micBits]() { self->onSdkStatus(run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep, micBits); },
+        self, [self, run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep, micBits, audioBits]() { self->onSdkStatus(run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep, micBits, audioBits); },
         Qt::QueuedConnection);
 }
 
-void CameraWorker::onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec, int micBits) {
+void CameraWorker::onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec, int micBits, int audioBits) {
     if (m_shuttingDown || !m_dev) return;
     // Gesture-friendly cadence: this push is the duty cycle's one shot — close
     // the window again so the control channel goes quiet for the recognizer.
@@ -290,7 +317,8 @@ void CameraWorker::onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr
     emit micStatus((txState & 0x1) != 0, (txState & 0x2) != 0,
                    (micBits & (1 << 0)) != 0,
                    (micBits & (1 << 3)) != 0,
-                   (micBits & (1 << 4)) != 0);
+                   (micBits & (1 << 4)) != 0,
+                   audioBits & 0x7, (audioBits >> 3) & 0x1f);
 }
 
 void CameraWorker::onDevChanged(const QString &sn, bool plugged) {
@@ -303,6 +331,7 @@ void CameraWorker::onDevChanged(const QString &sn, bool plugged) {
             m_dev.reset();
             m_aiTracking = false;
             m_twsSupported = false;
+            m_audioSupported = false;
             if (m_twsInfoTimer) m_twsInfoTimer->stop();
             emit deviceLost(QStringLiteral("USB unplug"));
         }
@@ -739,10 +768,12 @@ void CameraWorker::cmdSetMicButtonAction(int idx) {
     cmdReadTwsInfo();   // confirm from the device rather than trusting rc alone
 }
 
-// Diagnostic read: has_pair_record == 0 means this camera has never had a
-// wireless mic paired to it, which is the usual reason both slots read "not
-// connected" forever. Silent (no logLine on the failure path) — it runs on bind
-// and after pair/clear, never on a timer.
+// Two readbacks in one cheap call. has_pair_record == 0 means this camera has
+// never had a wireless mic paired to it, which is the usual reason both slots
+// read "not connected" forever. is_auto is the camera's source ARBITRATION flag
+// — load-bearing for the Audio section, since while it is on a manual source
+// pick is accepted and then reverted. Silent (no logLine on the failure path) —
+// it runs on bind and after pair/clear/source changes, never on a timer.
 void CameraWorker::cmdReadAudioSelect() {
     if (!m_dev) return;
     Device::AudioSelectAttr audio{};
@@ -751,11 +782,21 @@ void CameraWorker::cmdReadAudioSelect() {
         return;
     }
     emit micAudioSelect(audio.has_pair_record ? 1 : 0, audio.is_auto ? 1 : 0, audio.support_auto ? 1 : 0);
-    emit logLine("sys", QStringLiteral("wireless mic: pairing record %1 (auto source-select %2, supported %3)")
-                            .arg(audio.has_pair_record ? "present"
-                                                       : "NONE — no mic has ever been paired to this camera",
-                                 audio.is_auto ? "on" : "off",
-                                 audio.support_auto ? "yes" : "no"));
+    // Second opinion on the source, for the log only. The UI is driven by the
+    // status push's tiny.audio_mode.source; this getter is the independent way
+    // to tell a genuine "built-in" from a push field the firmware never fills
+    // in, without putting a second reader on the UI path.
+    unsigned char selected = 0;
+    const bool selOk = (ObsbotTws::getSelectedAudioSource(m_dev.get(), selected) == RM_RET_OK);
+    emit logLine("sys", QStringLiteral("audio: source %1 (auto source-select %2, supported %3); "
+                                       "wireless-mic pairing record %4")
+                            .arg(selOk ? QString::fromLatin1(audioSourceName(selected))
+                                       : QStringLiteral("unreported"),
+                                 audio.is_auto ? QStringLiteral("on") : QStringLiteral("off"),
+                                 audio.support_auto ? QStringLiteral("yes") : QStringLiteral("no"),
+                                 audio.has_pair_record
+                                     ? QStringLiteral("present")
+                                     : QStringLiteral("NONE — no mic has ever been paired to this camera")));
 }
 
 // The camera must be AWAKE for a pairing command to do anything: asleep it
@@ -839,6 +880,178 @@ void CameraWorker::cmdTxClear(int tx) {
     emit logLine(ok ? "ok" : "warn", QStringLiteral("%1  rc=%2").arg(a).arg(rc));
     statusPulse();
     cmdReadAudioSelect();
+}
+
+// ---------------------------------------------------------------------------
+// The camera's OWN microphone (Tiny 3 mic array)
+//
+// Two readback paths, and it matters which is which:
+//   * SOURCE and pickup MODE come from the status push (tiny.audio_mode) — a
+//     public, documented bitfield. Neither has an exported getter, so the push
+//     IS the confirmation and it lags a command by up to one push cycle.
+//   * volume / mute / noise reduction / AGC come from getters on the control
+//     channel and answer immediately, which is why cmdReadAudio runs right
+//     after every successful set: rc == 0 is not proof that a setting took.
+//
+// Nothing here is polled. The gesture work established that periodic control-
+// channel traffic suppresses the camera's recognizer, and none of these values
+// changes behind the app's back, so a timer would cost recognition for nothing.
+// ---------------------------------------------------------------------------
+
+// SILENT — no requireDevice, no logLine on the happy path: this runs on bind and
+// after every successful audio set. Doubles as the capability probe, exactly
+// like cmdReadTwsInfo: rc == RM_RET_OK from cameraGetAudioVolumeR means this
+// firmware answers the camera-audio API, and only then does the UI enable the
+// Audio section. Each sub-getter reports independently — one failing leg shows
+// as "—" instead of poisoning the whole read.
+void CameraWorker::cmdReadAudio() {
+    if (!m_dev) return;
+    short vol = 0;
+    const int rc = ObsbotTws::getAudioVolume(m_dev.get(), vol);
+    const bool ok = (rc == RM_RET_OK);
+    if (!m_audioProbed || ok != m_audioSupported) {
+        m_audioProbed = true;
+        m_audioSupported = ok;
+        emit logLine(ok ? "sys" : "warn",
+                     ok ? QStringLiteral("audio: camera-audio API available (cameraGetAudioVolumeR)")
+                        : QStringLiteral("audio: camera-audio API unavailable on this camera/firmware "
+                                         "(cameraGetAudioVolumeR rc=%1) — the Audio controls are disabled").arg(rc));
+    }
+    if (!ok) {
+        emit audioState(false, -1, -1, -1, -1, -1);
+        return;
+    }
+    bool muted = false;
+    const bool muteOk = (ObsbotTws::getAudioMute(m_dev.get(), muted) == RM_RET_OK);
+    bool nrOn = false;
+    int nrLevel = 0;
+    const bool nrOk = (ObsbotTws::getAudioNoiseReduce(m_dev.get(), nrOn, nrLevel) == RM_RET_OK);
+    bool agcOn = false;
+    const bool agcOk = (ObsbotTws::getAudioAgc(m_dev.get(), agcOn) == RM_RET_OK);
+    const int v = vol < 0 ? -1 : (vol > 100 ? 100 : static_cast<int>(vol));
+    emit audioState(true, v,
+                    muteOk ? (muted ? 1 : 0) : -1,
+                    nrOk ? (nrOn ? 1 : 0) : -1,
+                    nrOk ? nrLevel : -1,
+                    agcOk ? (agcOn ? 1 : 0) : -1);
+}
+
+void CameraWorker::cmdSetAudioVolume(int volume) {
+    const QString a = QStringLiteral("audio volume");
+    if (!requireDevice(a)) return;
+    const int v = volume < 0 ? 0 : (volume > 100 ? 100 : volume);   // SDK range 0–100
+    emit logLine("cmd", QStringLiteral("→ audio volume = %1").arg(v));
+    const int rc = ObsbotTws::setAudioVolume(m_dev.get(), static_cast<short>(v));
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, QString::number(v));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("audio volume = %1  rc=%2").arg(v).arg(rc));
+    // No statusPulse: this value is NOT in the status push. The getter below is
+    // the readback, and it answers on the same round trip.
+    cmdReadAudio();
+}
+
+void CameraWorker::cmdSetAudioMute(bool muted) {
+    const QString a = QStringLiteral("audio mute");
+    if (!requireDevice(a)) return;
+    emit logLine("cmd", QStringLiteral("→ audio %1").arg(muted ? "mute" : "unmute"));
+    const int rc = ObsbotTws::setAudioMute(m_dev.get(), muted);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, muted ? QStringLiteral("muted") : QStringLiteral("live"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("audio %1  rc=%2").arg(muted ? "muted" : "live").arg(rc));
+    cmdReadAudio();
+}
+
+void CameraWorker::cmdSetAudioNoiseReduce(bool on, int level) {
+    const QString a = QStringLiteral("audio noise reduction");
+    if (!requireDevice(a)) return;
+    const int lv = level < 1 ? 1 : (level > 10 ? 10 : level);   // documented range [1-10]
+    emit logLine("cmd", QStringLiteral("→ noise reduction %1 (level %2)").arg(on ? "on" : "off").arg(lv));
+    const int rc = ObsbotTws::setAudioNoiseReduce(m_dev.get(), on, lv);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, on ? QStringLiteral("on, level %1").arg(lv) : QStringLiteral("off"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("noise reduction %1 level %2  rc=%3")
+                                         .arg(on ? "on" : "off").arg(lv).arg(rc));
+    cmdReadAudio();
+}
+
+void CameraWorker::cmdSetAudioAgc(bool on) {
+    const QString a = QStringLiteral("audio agc");
+    if (!requireDevice(a)) return;
+    emit logLine("cmd", QStringLiteral("→ automatic gain %1").arg(on ? "on" : "off"));
+    const int rc = ObsbotTws::setAudioAgc(m_dev.get(), on);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, on ? QStringLiteral("on") : QStringLiteral("off"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("automatic gain %1  rc=%2").arg(on ? "on" : "off").arg(rc));
+    cmdReadAudio();
+}
+
+// Pickup pattern. Device::AudioMode's `source` field is annotated "use 0 for
+// now" in the public header, so ObsbotTws::setAudioMode pins it to 0 and only
+// `mode` carries meaning. There is no getter: the readback is the status push's
+// tiny.audio_mode.mode, hence statusPulse rather than a re-read.
+void CameraWorker::cmdSetAudioMode(int mode) {
+    const QString a = QStringLiteral("audio pickup");
+    if (!requireDevice(a)) return;
+    if (mode < Device::AudioModeOmni || mode >= Device::AudioModeButt) {
+        emit commandResult(a, false, -1, QStringLiteral("invalid pattern %1").arg(mode));
+        emit logLine("warn", a + QStringLiteral(": invalid pattern %1 (expected 0..%2)")
+                                     .arg(mode).arg(Device::AudioModeButt - 1));
+        return;
+    }
+    emit logLine("cmd", QStringLiteral("→ audio pickup pattern = %1").arg(mode));
+    const int rc = ObsbotTws::setAudioMode(m_dev.get(), mode);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, ok ? QStringLiteral("applied") : QStringLiteral("failed"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("audio pickup pattern = %1  rc=%2").arg(mode).arg(rc));
+    statusPulse();   // the honest confirmation is tiny.audio_mode.mode in the next push
+}
+
+// Pin the input source.
+//
+// HARDWARE FINDING, the whole reason this is one command and not two: while the
+// camera's own arbitration is on (AudioSelectAttr::is_auto == 1), a source pick
+// is ACCEPTED with rc=0 and then silently reverted a moment later. Selecting a
+// source therefore IMPLIES turning automatic selection off — done here, in this
+// order, and said out loud in the log so the user is never surprised by a
+// setting they did not knowingly change.
+void CameraWorker::cmdSetAudioSource(int source) {
+    const QString a = QStringLiteral("audio source");
+    if (!requireDevice(a)) return;
+    if (source < Device::DevAudioSourceTypeBuildIn || source > Device::DevAudioSourceTypeUsbC) {
+        emit commandResult(a, false, -1, QStringLiteral("invalid source %1").arg(source));
+        emit logLine("warn", a + QStringLiteral(": invalid source %1 (expected 0..%2)")
+                                     .arg(source).arg(static_cast<int>(Device::DevAudioSourceTypeUsbC)));
+        return;
+    }
+    const QString name = QString::fromLatin1(audioSourceName(source));
+    emit logLine("cmd", QStringLiteral("→ audio source = %1 (automatic selection turned off first — "
+                                       "with it on the camera accepts a manual pick and then reverts it)")
+                            .arg(name));
+    const int autoRc = ObsbotTws::setAudioSelect(m_dev.get(), false);
+    if (autoRc != RM_RET_OK)
+        emit logLine("warn", a + QStringLiteral(": could not turn automatic selection off (rc=%1) — "
+                                                "the camera may revert this pick").arg(autoRc));
+    const int rc = ObsbotTws::setAudioSource(m_dev.get(), source);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, ok ? name : QStringLiteral("failed"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("audio source = %1  rc=%2%3").arg(name).arg(rc)
+                                         .arg(ok ? QStringLiteral(" — waiting for the camera to report it")
+                                                 : QString()));
+    statusPulse();          // tiny.audio_mode.source is the honest confirmation
+    cmdReadAudioSelect();   // …and this confirms the auto flag really cleared
+}
+
+void CameraWorker::cmdSetAudioAuto(bool on) {
+    const QString a = QStringLiteral("audio auto source");
+    if (!requireDevice(a)) return;
+    emit logLine("cmd", QStringLiteral("→ automatic audio-source selection %1").arg(on ? "on" : "off"));
+    const int rc = ObsbotTws::setAudioSelect(m_dev.get(), on);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, on ? QStringLiteral("on") : QStringLiteral("off"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("automatic audio-source selection %1  rc=%2")
+                                         .arg(on ? "on" : "off").arg(rc));
+    statusPulse();          // the camera may switch source as a result
+    cmdReadAudioSelect();   // is_auto readback — a direct getter, answers now
 }
 
 // ---------------------------------------------------------------------------

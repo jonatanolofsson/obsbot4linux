@@ -81,10 +81,38 @@ public slots:
     // wireless_mic.tx_state going non-zero in the status push (micStatus).
     void cmdTxPair(int tx, bool enable);
     void cmdTxClear(int tx);
-    // Audio-source auto-select attributes (Device::cameraGetAudioSelectR). One
-    // cheap read; has_pair_record == 0 is the "no mic has ever been paired to
-    // this camera" diagnostic. Silent, emits micPairRecord.
+    // Audio-source auto-select attributes (Device::cameraGetAudioSelectR),
+    // emitted as micAudioSelect. Two jobs: has_pair_record == 0 is the "no mic
+    // has ever been paired to this camera" diagnostic, and is_auto is the
+    // ARBITRATION flag the Audio section depends on — while it is 1 the camera
+    // picks the input itself and reverts any manual choice (see cmdSetAudioSource).
     void cmdReadAudioSelect();
+
+    // The camera's OWN microphone (the Tiny 3's mic array).
+    //
+    // SOURCE and pickup MODE need no call at all: the SDK status push carries
+    // them in CameraStatus's tiny.audio_mode bitfield (source:3 / mode:5), so
+    // they ride the existing micStatus signal. Everything below is the part the
+    // push does NOT carry, reached through ObsbotTwsCompat.h.
+    //
+    // cmdReadAudio does ONE pass — volume, mute, noise reduction (+level), AGC —
+    // and doubles as the capability probe: if cameraGetAudioVolumeR does not
+    // answer RM_RET_OK, `supported` is false and the whole Audio section is
+    // shown as unavailable rather than filled with invented zeroes. Called on
+    // bind and after a successful set; deliberately NOT on a timer (see the
+    // gesture-recognizer traffic finding — nothing here changes behind our back).
+    void cmdReadAudio();
+    void cmdSetAudioVolume(int volume);              // [0-100]
+    void cmdSetAudioMute(bool muted);
+    void cmdSetAudioNoiseReduce(bool on, int level); // level [1-10]
+    void cmdSetAudioAgc(bool on);
+    void cmdSetAudioMode(int mode);                  // Device::AudioModeType 0..5
+    // HARDWARE FINDING: while the camera's own source arbitration is on
+    // (AudioSelectAttr::is_auto == 1) a source pick is accepted with rc=0 and
+    // then silently reverted. cmdSetAudioSource therefore turns arbitration OFF
+    // first, in this one command, and says so in the log.
+    void cmdSetAudioSource(int source);              // Device::DevAudioSourceType
+    void cmdSetAudioAuto(bool on);                   // camera picks the source itself
 
     // VELOCITY (hold-to-move) PTZ — gated behind four safety stops, per the
     // design handoff: stop-on-release (caller stops sending on pointer-up),
@@ -136,7 +164,12 @@ signals:
     // tx1/tx2 are the two transmitter slots the camera reports online; twsMode
     // distinguishes BT TWS mode from the Vox SE's 2.4 GHz mode; pairing/scanning
     // are the camera's own link state.
-    void micStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning);
+    // audioSource/audioMode come from the SAME push (tiny.audio_mode): the
+    // camera's current input (Device::DevAudioSourceType — 3 = the wireless Vox
+    // SE) and its mic-array pickup pattern (Device::AudioModeType). They ride
+    // this signal because they are pushed, not polled — no extra USB traffic.
+    void micStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning,
+                   int audioSource, int audioMode);
     // Wireless-mic DETAIL from Device::cameraGetTWSInfoR (see ObsbotTwsCompat.h).
     // supported=false means the call is unavailable on this build/firmware and
     // every other field is meaningless — the UI must show "unavailable", not 0.
@@ -149,8 +182,15 @@ signals:
                  int batt2, bool charging2, bool muted2);
     // Device::cameraGetAudioSelectR readback. Each field is -1 when the call is
     // unavailable, else 0/1. hasPairRecord == 0 means no mic has ever been
-    // paired to this camera.
+    // paired to this camera. isAuto is the source ARBITRATION flag — while it is
+    // 1 the camera overrides any manual source pick.
     void micAudioSelect(int hasPairRecord, int isAuto, int supportAuto);
+    // Built-in-audio readback from cmdReadAudio. supported=false means this
+    // build/firmware does not answer the camera-audio API and every other field
+    // is meaningless — the UI must say "unavailable", not show 0. volume is
+    // 0–100, noiseLevel 1–10; muted/noiseReduce/agc are 0/1, and every field is
+    // -1 when unknown.
+    void audioState(bool supported, int volume, int muted, int noiseReduce, int noiseLevel, int agc);
 
 private:
     void pollTick();
@@ -178,7 +218,9 @@ private:
     // micBits packs CameraStatus::tiny.wireless_mic (a 1-byte bitfield the SDK
     // callback must not be trusted to keep alive) in the DEVICE's own bit order:
     // bit0 is_tws_mode, bits1-2 tx_state, bit3 is_pairing, bit4 is_scanning.
-    void onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec, int micBits);
+    // audioBits packs the neighbouring tiny.audio_mode byte the same way:
+    // bits0-2 source (DevAudioSourceType), bits3-7 mode (AudioModeType).
+    void onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec, int micBits, int audioBits);
     void onDevChanged(const QString &sn, bool plugged);
 
     static void sdkStatusTrampoline(void *param, const void *data);
@@ -195,6 +237,11 @@ private:
     // m_twsProbed makes the FIRST verdict always log, including a negative one.
     bool m_twsSupported = false;
     bool m_twsProbed = false;
+    // Same pair for the camera-audio API (cameraGetAudioVolumeR answered). Kept
+    // separate from m_twsSupported: a camera can perfectly well have a working
+    // mic array and no wireless-mic support, or the reverse.
+    bool m_audioSupported = false;
+    bool m_audioProbed = false;
     int m_pollElapsedMs = 0;
     int m_pollTimeoutMs = 6000;
     bool m_devChangedRegistered = false;

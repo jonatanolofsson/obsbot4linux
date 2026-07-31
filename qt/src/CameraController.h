@@ -134,6 +134,36 @@ class CameraController : public QObject {
     // mic extras as unavailable rather than pretend.
     Q_PROPERTY(bool capMicButton READ capMicButton NOTIFY micChanged)
 
+    // ----- the camera's own microphone (the Tiny 3's mic array) -----
+    // Every value is -1 while unknown — including when the camera does not
+    // answer the camera-audio API — so the UI can show "—" instead of an
+    // invented 0/off. audioVolume is 0–100, audioNoiseLevel 1–10, and
+    // audioMuted / audioNoiseReduce / audioAgc / audioAuto are 0/1.
+    Q_PROPERTY(int audioVolume MEMBER m_audioVolume NOTIFY audioChanged)
+    Q_PROPERTY(int audioMuted MEMBER m_audioMuted NOTIFY audioChanged)
+    Q_PROPERTY(int audioNoiseReduce MEMBER m_audioNoiseReduce NOTIFY audioChanged)
+    Q_PROPERTY(int audioNoiseLevel MEMBER m_audioNoiseLevel NOTIFY audioChanged)
+    Q_PROPERTY(int audioAgc MEMBER m_audioAgc NOTIFY audioChanged)
+    // Which input the camera is using (Device::DevAudioSourceType — 0 built-in,
+    // 3 = a wireless Vox SE) and the mic array's pickup pattern
+    // (Device::AudioModeType). Both are READ BACK from the status push's
+    // tiny.audio_mode; neither has an exported getter. audioSource/audioMode
+    // carry the optimistic in-flight pick so a selector does not spring back
+    // while the push catches up, while audioSourceName/audioModeName always
+    // report what the DEVICE said — the two are shown side by side on the page.
+    Q_PROPERTY(int audioSource READ audioSource NOTIFY audioChanged)
+    Q_PROPERTY(QString audioSourceName READ audioSourceName NOTIFY audioChanged)
+    Q_PROPERTY(int audioMode READ audioMode NOTIFY audioChanged)
+    Q_PROPERTY(QString audioModeName READ audioModeName NOTIFY audioChanged)
+    // The camera's OWN source arbitration (AudioSelectAttr::is_auto). While this
+    // is 1 the camera picks the input itself and overrides any manual choice —
+    // see setAudioSource.
+    Q_PROPERTY(int audioAuto MEMBER m_audioAuto NOTIFY audioChanged)
+    // Capability gate, resolved at RUNTIME like capMicButton: true once the
+    // bound camera answers Device::cameraGetAudioVolumeR (exported by libdev,
+    // absent from the public header — see ObsbotTwsCompat.h).
+    Q_PROPERTY(bool capAudio READ capAudio NOTIFY audioChanged)
+
 public:
     enum ConnState { Disconnected = 0, Discovering = 1, Connected = 2 };
     Q_ENUM(ConnState)
@@ -194,6 +224,18 @@ public:
     QString micButtonActionName() const;
     bool capMicButton() const { return m_capMicButton; }
 
+    // Same optimistic-while-in-flight idiom as micButtonAction: source and mode
+    // are only confirmed by the next status push (2–3 s, or the next duty window
+    // in low-traffic mode), so the selector shows the user's pick until the
+    // camera agrees — or until the confirm timer gives up and the device value
+    // takes over again. The *Name getters never do this: they are the "what the
+    // camera actually reports" row.
+    int audioSource() const { return m_audioSourceTarget >= 0 ? m_audioSourceTarget : m_audioSourceDevice; }
+    int audioMode() const { return m_audioModeTarget >= 0 ? m_audioModeTarget : m_audioModeDevice; }
+    QString audioSourceName() const;
+    QString audioModeName() const;
+    bool capAudio() const { return m_capAudio; }
+
 public slots:
     // property setters (persist)
     void setMoveStepDeg(int deg);
@@ -251,6 +293,22 @@ public slots:
     // device when the runtime probe says it will listen.
     void setMicButtonAction(int idx);
 
+    // The camera's own microphone. One command per user action — a rapid burst
+    // of audio/AI/sleep writes has been observed to put the camera into an AI
+    // fault (solid red LED, everything silently ignored), so nothing here is
+    // batched and nothing is re-sent on connect.
+    void setAudioVolume(int volume);      // 0–100
+    void setAudioMute(bool muted);
+    void setAudioNoiseReduce(bool on);    // keeps the current level
+    void setAudioNoiseLevel(int level);   // 1–10, keeps the current on/off state
+    void setAudioAgc(bool on);
+    void setAudioMode(int mode);          // pickup pattern, Device::AudioModeType
+    // Pinning a source IMPLIES turning the camera's own arbitration off: with it
+    // on, the pick is accepted and then silently reverted (hardware finding).
+    // The worker does both in one command and logs that it did.
+    void setAudioSource(int source);      // Device::DevAudioSourceType
+    void setAudioAuto(bool on);           // hand source selection back to the camera
+
 signals:
     void connStateChanged();
     void identityChanged();
@@ -264,6 +322,7 @@ signals:
     void commandResult(const QString &action, bool ok, const QString &message);
     void discoveryFinished(bool found);   // one-shot, used by --self-test
     void micChanged();
+    void audioChanged();   // the camera's own microphone (kept apart from micChanged)
 
 private slots:
     void onConnectionResolved(bool found, const QString &product, const QString &sn,
@@ -275,11 +334,13 @@ private slots:
     void onImageParams(int brightness, int contrast, int saturation, int sharpness);
     void onWorkerResult(const QString &action, bool ok, int rc, const QString &message);
     void onPresetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
-    void onMicStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning);
+    void onMicStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning,
+                     int audioSource, int audioMode);
     void onTwsInfo(bool supported, int keyCmd,
                    int batt1, bool charging1, bool muted1,
                    int batt2, bool charging2, bool muted2);
     void onMicAudioSelect(int hasPairRecord, int isAuto, int supportAuto);
+    void onAudioState(bool supported, int volume, int muted, int noiseReduce, int noiseLevel, int agc);
 
 private:
     double speedValue() const;   // speedMode -> gimbal reference speed
@@ -294,6 +355,10 @@ private:
     void applyPowerSettings(const QString &why);
     // Raise the in-flight cue for a mic pair/clear, with a safety timeout.
     void micPairBusyCue(int timeoutMs);
+    // Shared guard for the built-in-audio setters. QML already disables those
+    // controls without capAudio, so getting here means something raced (the
+    // device went away mid-click) — say so instead of swallowing the action.
+    bool audioReady(const QString &what);
 
     QThread m_thread;
     CameraWorker *m_worker = nullptr;
@@ -366,6 +431,25 @@ private:
     int m_micButtonTarget = -1;
     QTimer *m_micButtonTimer = nullptr;
     bool m_capMicButton = false; // runtime probe: cameraGetTWSInfoR answered OK
+
+    // The camera's own microphone. -1 everywhere means "unknown" — the value the
+    // UI renders as "—" rather than guessing.
+    int m_audioVolume = -1;       // 0–100
+    int m_audioMuted = -1;        // 0/1
+    int m_audioNoiseReduce = -1;  // 0/1
+    int m_audioNoiseLevel = -1;   // 1–10
+    int m_audioAgc = -1;          // 0/1
+    int m_audioAuto = -1;         // AudioSelectAttr::is_auto (0/1)
+    // From the status push's tiny.audio_mode — the ONLY readback either of these
+    // has (no exported getter), which is why both carry an optimistic in-flight
+    // target with a give-up timer, exactly like the mic-button assignment.
+    int m_audioSourceDevice = -1;
+    int m_audioModeDevice = -1;
+    int m_audioSourceTarget = -1;
+    int m_audioModeTarget = -1;
+    QTimer *m_audioSourceTimer = nullptr;
+    QTimer *m_audioModeTimer = nullptr;
+    bool m_capAudio = false;      // runtime probe: cameraGetAudioVolumeR answered OK
 
     bool m_previewAvailable = false;
     // Managed ffplay preview process (NOT detached) so it is killed when the app

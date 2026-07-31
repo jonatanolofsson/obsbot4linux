@@ -1,10 +1,11 @@
-// ObsbotTwsCompat — access to three wireless-mic (TWS) entry points that the
-// OBSBOT libdev shared library EXPORTS but the public SDK header does not
-// DECLARE.
+// ObsbotTwsCompat — access to the wireless-mic (TWS) and camera-audio entry
+// points that the OBSBOT libdev shared library EXPORTS but the public SDK header
+// does not DECLARE.
 //
 // Why this file exists
 // -------------------
-// The Vox SE wireless-mic feature needs a handful of calls that are missing from
+// The Vox SE wireless-mic feature — and the Tiny 3's own built-in mic array —
+// need a handful of calls that are missing from
 // sdk/libdev_v2.1.0_8/include/dev/dev.hpp and from OBSBOT's own OBSBOT_Sample
 // (grep either for "TWS": nothing). They are nonetheless real, exported,
 // non-virtual Device member functions in libdev.so — verified with
@@ -16,6 +17,8 @@
 //       _ZN6Device20cameraSetTWSKeyTypeRENS_13DevTWSKeyTypeE
 //   Device::cameraGetAudioSelectR(Device::AudioSelectAttr&)
 //       _ZN6Device21cameraGetAudioSelectRERNS_15AudioSelectAttrE
+//   Device::cameraSetAudioSelect(Device::AudioSelectParam&)
+//       _ZN6Device20cameraSetAudioSelectERNS_16AudioSelectParamE
 //   Device::cameraTXSetPairEnabled(Device::DevTXType, bool)
 //       _ZN6Device22cameraTXSetPairEnabledENS_9DevTXTypeEb
 //   Device::cameraTXClearPairedInfo(Device::DevTXType)
@@ -25,12 +28,47 @@
 //   Device::setBlePairingExit()
 //       _ZN6Device17setBlePairingExitEv
 //
+// …and, for the camera's OWN microphone (the Tiny 3's mic array), a second
+// family in exactly the same situation — exported, undeclared:
+//
+//   Device::cameraGetAudioVolumeR(short&)              [0-100]
+//       _ZN6Device21cameraGetAudioVolumeRERs
+//   Device::cameraSetAudioVolumeR(short)
+//       _ZN6Device21cameraSetAudioVolumeREs
+//   Device::cameraGetAudioSourceMuteR(bool&)
+//       _ZN6Device25cameraGetAudioSourceMuteRERb
+//   Device::cameraSetAudioSourceMuteR(bool)
+//       _ZN6Device25cameraSetAudioSourceMuteREb
+//   Device::cameraGetAudioNoiseReduceR(bool&, int&)    level [1-10]
+//       _ZN6Device26cameraGetAudioNoiseReduceRERbRi
+//   Device::cameraSetAudioNoiseReduceR(bool, int)
+//       _ZN6Device26cameraSetAudioNoiseReduceREbi
+//   Device::cameraGetAudioAGCR(bool&)
+//       _ZN6Device18cameraGetAudioAGCRERb
+//   Device::cameraSetAudioAGCR(bool)
+//       _ZN6Device18cameraSetAudioAGCREb
+//   Device::cameraSetAudioModeU(Device::AudioMode)     pickup pattern
+//       _ZN6Device19cameraSetAudioModeUENS_9AudioModeE
+//   Device::cameraSetAudioSourceR(int)                 DevAudioSourceType
+//       _ZN6Device21cameraSetAudioSourceREi
+//   Device::cameraGetSelectedAudioSourceR(unsigned char&)
+//       _ZN6Device29cameraGetSelectedAudioSourceRERh
+//
+// There is deliberately NO getter wrapper for the audio SOURCE or the audio
+// MODE here: both are pushed by the camera for free in
+// CameraStatus::tiny.audio_mode (a public, documented bitfield —
+// `source : 3` / `mode : 5`), so the status push is the readback and no extra
+// USB round trip is spent on them. cameraGetSelectedAudioSourceR is bound only
+// because it is the one call that reports which source the camera's OWN
+// arbitration picked; it is not on any hot path.
+//
 // The vendored SDK is kept PRISTINE — an unmodified official drop — so these
 // prototypes cannot simply be pasted into dev.hpp. Instead the app binds them
 // by their exact exported symbol name using GCC/Clang `__asm__` labels. The
 // argument TYPES (Device::DevTWSInfo, Device::DevTWSKeyType,
-// Device::AudioSelectAttr, Device::DevTXType) all live in the stock public
-// header, so only the entry points need re-declaring here.
+// Device::AudioSelectAttr, Device::AudioSelectParam, Device::AudioMode,
+// Device::DevTXType) all live in the stock public header, so only the entry
+// points need re-declaring here.
 //
 // Mind Device::DevTXType: it is ONE-BASED in the official header
 // (`enum DevTXType { DevTX1 = 1, DevTX2 };`). Never pass a 0-based slot index.
@@ -41,10 +79,12 @@
 // function is an ordinary function whose implicit first argument is the `this`
 // pointer, and whose reference parameters are passed as pointers. So
 // `dev->cameraGetTWSInfoR(info)` is ABI-identical to
-// `obsbot_cameraGetTWSInfoR(dev, &info)` declared below. All three symbols are
-// plain text symbols (`T` in nm), not vtable slots, so no thunk/adjustment is
-// involved and the raw Device* from std::shared_ptr::get() is the correct
-// `this`.
+// `obsbot_cameraGetTWSInfoR(dev, &info)` declared below. Every symbol bound here
+// is a plain text symbol (`T` in nm), not a vtable slot, so no thunk/adjustment
+// is involved and the raw Device* from std::shared_ptr::get() is the correct
+// `this`. Small by-value struct parameters (Device::AudioMode — two uint8_t)
+// keep their normal parameter class: the declaration below names the SAME type
+// the library was compiled against, so the compiler reproduces the ABI exactly.
 //
 // Safety / degradation
 // -------------------
@@ -116,6 +156,64 @@ int32_t obsbot_setBlePairingEnable(Device *self, bool enable, unsigned char type
     __asm__("_ZN6Device19setBlePairingEnableEbh") __attribute__((weak));
 int32_t obsbot_setBlePairingExit(Device *self)
     __asm__("_ZN6Device17setBlePairingExitEv") __attribute__((weak));
+
+// --- the camera's OWN microphone (Tiny 3 mic array) -------------------------
+
+/// Device::cameraGetAudioVolumeR / cameraSetAudioVolumeR — input gain of the
+/// SELECTED audio source, range [0-100]. Note the `short`: the getter takes a
+/// short&, so passing an int* here would corrupt the stack.
+int32_t obsbot_cameraGetAudioVolumeR(Device *self, short *volume)
+    __asm__("_ZN6Device21cameraGetAudioVolumeRERs") __attribute__((weak));
+int32_t obsbot_cameraSetAudioVolumeR(Device *self, short volume)
+    __asm__("_ZN6Device21cameraSetAudioVolumeREs") __attribute__((weak));
+
+/// Device::cameraGetAudioSourceMuteR / cameraSetAudioSourceMuteR — mute of the
+/// SELECTED audio source (not the Vox SE's own mute, which lives in DevTWSInfo).
+int32_t obsbot_cameraGetAudioSourceMuteR(Device *self, bool *muted)
+    __asm__("_ZN6Device25cameraGetAudioSourceMuteRERb") __attribute__((weak));
+int32_t obsbot_cameraSetAudioSourceMuteR(Device *self, bool muted)
+    __asm__("_ZN6Device25cameraSetAudioSourceMuteREb") __attribute__((weak));
+
+/// Device::cameraGetAudioNoiseReduceR / cameraSetAudioNoiseReduceR — noise
+/// suppression on/off plus its strength, range [1-10] (the range the public
+/// header documents for DevAudioInputSourceNoiseReduce::level).
+int32_t obsbot_cameraGetAudioNoiseReduceR(Device *self, bool *enabled, int *level)
+    __asm__("_ZN6Device26cameraGetAudioNoiseReduceRERbRi") __attribute__((weak));
+int32_t obsbot_cameraSetAudioNoiseReduceR(Device *self, bool enabled, int level)
+    __asm__("_ZN6Device26cameraSetAudioNoiseReduceREbi") __attribute__((weak));
+
+/// Device::cameraGetAudioAGCR / cameraSetAudioAGCR — automatic gain control.
+int32_t obsbot_cameraGetAudioAGCR(Device *self, bool *enabled)
+    __asm__("_ZN6Device18cameraGetAudioAGCRERb") __attribute__((weak));
+int32_t obsbot_cameraSetAudioAGCR(Device *self, bool enabled)
+    __asm__("_ZN6Device18cameraSetAudioAGCREb") __attribute__((weak));
+
+/// Device::cameraSetAudioModeU — the mic array's pickup pattern. The struct's
+/// `source` field is annotated "暂时用0" ("use 0 for now") in the public header,
+/// so only `mode` (a Device::AudioModeType) carries meaning. Readback is the
+/// status push's tiny.audio_mode.mode, NOT a getter — there is no exported one.
+int32_t obsbot_cameraSetAudioModeU(Device *self, Device::AudioMode mode)
+    __asm__("_ZN6Device19cameraSetAudioModeUENS_9AudioModeE") __attribute__((weak));
+
+/// Device::cameraSetAudioSourceR — pick the input, a Device::DevAudioSourceType
+/// (0 built-in, 3 Bluetooth = the Vox SE).
+/// HARDWARE NOTE: while AudioSelectAttr::is_auto == 1 the camera arbitrates the
+/// source itself and this call is ACCEPTED (rc=0) and then silently reverted.
+/// Always clear auto with setAudioSelect{is_auto=0} first — see
+/// CameraWorker::cmdSetAudioSource.
+int32_t obsbot_cameraSetAudioSourceR(Device *self, int source)
+    __asm__("_ZN6Device21cameraSetAudioSourceREi") __attribute__((weak));
+
+/// Device::cameraSetAudioSelect — turn the camera's own source arbitration on
+/// or off (the write counterpart of cameraGetAudioSelectR).
+int32_t obsbot_cameraSetAudioSelect(Device *self, Device::AudioSelectParam *param)
+    __asm__("_ZN6Device20cameraSetAudioSelectERNS_16AudioSelectParamE") __attribute__((weak));
+
+/// Device::cameraGetSelectedAudioSourceR — which source the camera is actually
+/// using right now (a DevAudioSourceType in a byte). Diagnostic only: the status
+/// push carries the same value in tiny.audio_mode.source for free.
+int32_t obsbot_cameraGetSelectedAudioSourceR(Device *self, unsigned char *source)
+    __asm__("_ZN6Device29cameraGetSelectedAudioSourceRERh") __attribute__((weak));
 
 } // extern "C"
 
@@ -221,6 +319,164 @@ inline int32_t blePairingExit(Device *dev) {
     return obsbot_setBlePairingExit(dev);
 #else
     (void)dev;
+    return RM_RET_ERR;
+#endif
+}
+
+/// Turn the camera's own audio-source arbitration on/off. Must be set to false
+/// BEFORE setAudioSource, or the camera reverts the pick (hardware finding).
+inline int32_t setAudioSelect(Device *dev, bool isAuto) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraSetAudioSelect == nullptr) return RM_RET_ERR;
+    Device::AudioSelectParam p{};
+    p.is_auto = isAuto ? 1 : 0;
+    return obsbot_cameraSetAudioSelect(dev, &p);
+#else
+    (void)dev;
+    (void)isAuto;
+    return RM_RET_ERR;
+#endif
+}
+
+// --- the camera's OWN microphone --------------------------------------------
+
+/// True when this build can reach the camera-audio entry points at all. Separate
+/// from linked(): a future libdev could ship one family and not the other.
+/// Says nothing about whether the CAMERA answers — probe with getVolume().
+inline bool audioLinked() {
+#if OBSBOT_TWS_COMPAT
+    return obsbot_cameraGetAudioVolumeR != nullptr && obsbot_cameraSetAudioVolumeR != nullptr;
+#else
+    return false;
+#endif
+}
+
+inline int32_t getAudioVolume(Device *dev, short &volume) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraGetAudioVolumeR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraGetAudioVolumeR(dev, &volume);
+#else
+    (void)dev;
+    (void)volume;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t setAudioVolume(Device *dev, short volume) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraSetAudioVolumeR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraSetAudioVolumeR(dev, volume);
+#else
+    (void)dev;
+    (void)volume;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t getAudioMute(Device *dev, bool &muted) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraGetAudioSourceMuteR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraGetAudioSourceMuteR(dev, &muted);
+#else
+    (void)dev;
+    (void)muted;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t setAudioMute(Device *dev, bool muted) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraSetAudioSourceMuteR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraSetAudioSourceMuteR(dev, muted);
+#else
+    (void)dev;
+    (void)muted;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t getAudioNoiseReduce(Device *dev, bool &enabled, int &level) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraGetAudioNoiseReduceR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraGetAudioNoiseReduceR(dev, &enabled, &level);
+#else
+    (void)dev;
+    (void)enabled;
+    (void)level;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t setAudioNoiseReduce(Device *dev, bool enabled, int level) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraSetAudioNoiseReduceR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraSetAudioNoiseReduceR(dev, enabled, level);
+#else
+    (void)dev;
+    (void)enabled;
+    (void)level;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t getAudioAgc(Device *dev, bool &enabled) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraGetAudioAGCR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraGetAudioAGCR(dev, &enabled);
+#else
+    (void)dev;
+    (void)enabled;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t setAudioAgc(Device *dev, bool enabled) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraSetAudioAGCR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraSetAudioAGCR(dev, enabled);
+#else
+    (void)dev;
+    (void)enabled;
+    return RM_RET_ERR;
+#endif
+}
+
+/// mode is a Device::AudioModeType. source is pinned to 0 — the header says
+/// "use 0 for now" and the field carries no meaning yet.
+inline int32_t setAudioMode(Device *dev, int mode) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraSetAudioModeU == nullptr) return RM_RET_ERR;
+    Device::AudioMode m{};
+    m.source = 0;
+    m.mode = static_cast<uint8_t>(mode);
+    return obsbot_cameraSetAudioModeU(dev, m);
+#else
+    (void)dev;
+    (void)mode;
+    return RM_RET_ERR;
+#endif
+}
+
+/// source is a Device::DevAudioSourceType. Clear is_auto FIRST (see the
+/// declaration's hardware note) or the camera will revert this.
+inline int32_t setAudioSource(Device *dev, int source) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraSetAudioSourceR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraSetAudioSourceR(dev, source);
+#else
+    (void)dev;
+    (void)source;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t getSelectedAudioSource(Device *dev, unsigned char &source) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraGetSelectedAudioSourceR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraGetSelectedAudioSourceR(dev, &source);
+#else
+    (void)dev;
+    (void)source;
     return RM_RET_ERR;
 #endif
 }
