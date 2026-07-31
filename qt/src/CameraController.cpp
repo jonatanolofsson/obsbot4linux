@@ -34,7 +34,8 @@ constexpr qint64 kAiDisengageHintMs = 20000;
 // Safety net for the mic pair/clear busy cue. Longer than the worker's
 // wake-settle delay plus a round trip, so a normal command always clears the cue
 // via its result and this only fires if one is never answered.
-constexpr int kMicPairCueMaxMs = 12000;
+constexpr int kMicPairCueMaxMs = 12000;    // clear: the camera answers on its own
+constexpr int kMicPairWaitMaxMs = 90000;   // pair: long enough to fetch the mic and hold its button
 } // namespace
 
 CameraController::CameraController(QObject *parent) : QObject(parent) {
@@ -52,6 +53,20 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     connect(m_pendingTimer, &QTimer::timeout, this, [this]() {
         m_aiInFlight = 0;
         if (m_aiPending) { m_aiPending = false; emit aiChanged(); }
+    });
+
+    // Same safety net for the mic-button selector: if the camera never confirms
+    // the new assignment, stop showing the optimistic value and fall back to
+    // whatever the device actually reports.
+    m_micButtonTimer = new QTimer(this);
+    m_micButtonTimer->setSingleShot(true);
+    m_micButtonTimer->setInterval(4000);
+    connect(m_micButtonTimer, &QTimer::timeout, this, [this]() {
+        if (m_micButtonTarget >= 0) {
+            emit logLine("warn", QStringLiteral("mic button: camera did not confirm the new assignment"));
+            m_micButtonTarget = -1;
+            emit micChanged();
+        }
     });
 
     m_worker = new CameraWorker;   // no parent: it will live on m_thread
@@ -272,6 +287,12 @@ void CameraController::setMicButtonAction(int idx) {
         emit logLine("warn", QStringLiteral("mic button: camera does not expose the mic API"));
         return;
     }
+    // Show the pick immediately. The camera's own readback trails the command,
+    // so without this the selector springs back to the old segment and the user
+    // has to click several times before it appears to take.
+    m_micButtonTarget = idx;
+    m_micButtonTimer->start();
+    emit micChanged();
     QMetaObject::invokeMethod(m_worker, "cmdSetMicButtonAction", Qt::QueuedConnection,
                               Q_ARG(int, idx));
 }
@@ -590,27 +611,43 @@ void CameraController::saveCurrentToNextEmpty() {
 // unsupported at first. Success shows up as the slot going online in the status
 // push, not as the command's rc.
 // ---------------------------------------------------------------------------
-void CameraController::micPairTx(int tx) {
-    if (tx != 1 && tx != 2) return;
-    micPairBusyCue();
+// Start pairing. There is deliberately NO slot argument: hardware testing showed
+// the camera ignores the DevTXType it is given and links the incoming mic to
+// whichever slot it likes (asking to re-pair slot 1 put the mic in slot 2). The
+// UI therefore offers one "Pair a mic" action rather than pretending the choice
+// exists, and we pass DevTX1 purely because the SDK call requires some value.
+void CameraController::micPair() {
+    micPairBusyCue(kMicPairWaitMaxMs);
     QMetaObject::invokeMethod(m_worker, "cmdTxPair", Qt::QueuedConnection,
-                              Q_ARG(int, tx), Q_ARG(bool, true));
+                              Q_ARG(int, 1), Q_ARG(bool, true));
 }
 
 void CameraController::micClearPairing(int tx) {
     if (tx != 1 && tx != 2) return;
-    micPairBusyCue();
+    micPairBusyCue(kMicPairCueMaxMs);
     QMetaObject::invokeMethod(m_worker, "cmdTxClear", Qt::QueuedConnection, Q_ARG(int, tx));
 }
 
-// Busy cue for an in-flight pair/clear. Cleared by the command's result; the
-// timeout is only a safety net so the cue can never stick (the worker may defer
-// the real command by a wake-settle delay).
-void CameraController::micPairBusyCue() {
+// Busy cue for an in-flight pair/clear.
+//
+// For PAIRING the wait is genuinely long: the camera accepts the request in
+// milliseconds, but the link only forms once the user has fetched the mic and
+// held its button for ~6 s. Clearing the cue on the command's result therefore
+// made the button look dead — it blinked once and gave up while the camera was
+// still listening. The cue now survives until a slot actually comes online (see
+// onMicStatus), a failure comes back, or the long timeout expires.
+void CameraController::micPairBusyCue(int timeoutMs) {
     m_micPairBusy = true;
+    ++m_micPairCueGen;
+    const quint64 gen = m_micPairCueGen;
     emit micChanged();
-    QTimer::singleShot(kMicPairCueMaxMs, this, [this]() {
-        if (m_micPairBusy) { m_micPairBusy = false; emit micChanged(); }
+    QTimer::singleShot(timeoutMs, this, [this, gen]() {
+        // Only the newest cue may time itself out; a later press supersedes it.
+        if (gen != m_micPairCueGen || !m_micPairBusy) return;
+        m_micPairBusy = false;
+        emit logLine("warn", QStringLiteral("pairing: no mic appeared — hold the mic's button "
+                                            "for about 6 s while pairing is open"));
+        emit micChanged();
     });
 }
 
@@ -689,6 +726,8 @@ void CameraController::onDeviceLost(const QString &reason) {
     m_micPairBusy = false;
     m_micPairRecord = -1;
     m_micButtonDevice = -1;
+    m_micButtonTarget = -1;   // a reconnect must not resurrect a stale optimistic pick
+    if (m_micButtonTimer) m_micButtonTimer->stop();
     m_capMicButton = false;   // re-probed on the next bind, never assumed
     emit connStateChanged();
     emit statusChanged();
@@ -842,10 +881,12 @@ void CameraController::onWorkerResult(const QString &action, bool ok, int /*rc*/
         emit imageChanged();
     } else if (action.startsWith(QLatin1String("mic pair"))
                || action.startsWith(QLatin1String("mic clear"))) {
-        // Command resolved (ok or not) — drop the in-flight cue. Note ok==true
-        // only means the camera accepted the request; the link itself is
-        // confirmed by the slot going online in onMicStatus.
-        if (m_micPairBusy) { m_micPairBusy = false; emit micChanged(); }
+        // ok==true only means the camera ACCEPTED the request. For pairing the
+        // link is confirmed later, by a slot going online in onMicStatus, so a
+        // successful "mic pair" must leave the cue running — otherwise the UI
+        // stops indicating anything while the camera is still listening.
+        const bool isPair = action.startsWith(QLatin1String("mic pair"));
+        if (m_micPairBusy && (!isPair || !ok)) { m_micPairBusy = false; emit micChanged(); }
     }
     emit commandResult(action, ok, message);
 }
@@ -874,6 +915,13 @@ void CameraController::onMicStatus(bool tx1Online, bool tx2Online, bool twsMode,
     // A slot coming online is the one moment a fresh battery reading is worth a
     // round trip — otherwise the 60 s refresh would leave it blank for a minute.
     const bool cameOnline = (tx1Online && !m_micTx[0].online) || (tx2Online && !m_micTx[1].online);
+    // The link forming is what actually ends a pairing wait — not the command's
+    // return code, which only says the camera started listening.
+    if (cameOnline && m_micPairBusy) {
+        m_micPairBusy = false;
+        ++m_micPairCueGen;   // supersede the pending timeout
+        emit logLine("ok", QStringLiteral("pairing: a mic came online"));
+    }
     m_micTx[0].online = tx1Online;
     m_micTx[1].online = tx2Online;
     m_micTwsMode = twsMode;
@@ -902,12 +950,26 @@ void CameraController::onTwsInfo(bool supported, int keyCmd,
         return;
     }
     m_micButtonDevice = (keyCmd >= 0 && keyCmd <= 3) ? keyCmd : -1;
+    // Once the camera reports the value we asked for, the optimistic override
+    // has done its job and the device becomes the single source of truth again.
+    if (m_micButtonTarget >= 0 && m_micButtonDevice == m_micButtonTarget) {
+        m_micButtonTarget = -1;
+        m_micButtonTimer->stop();
+    }
     // The battery bytes only mean something for a slot the camera says is
     // online — an empty slot keeps whatever was last written there.
-    m_micTx[0].battery = m_micTx[0].online ? batt1 : -1;
+    //
+    // A CONNECTED mic reporting 0 % is treated as "unknown", not as a real
+    // reading: the camera answers 0 for a slot it has not filled in yet, so
+    // right after a (re)pair the UI would otherwise flash a red "0 %" flat-
+    // battery alarm for a mic that is actually fine — observed with a mic at
+    // 77 %. A genuinely empty mic powers itself off rather than staying
+    // connected at zero, so "—" is the honest reading for 0.
+    const auto batteryOf = [](bool online, int raw) { return (online && raw > 0) ? raw : -1; };
+    m_micTx[0].battery = batteryOf(m_micTx[0].online, batt1);
     m_micTx[0].charging = m_micTx[0].online && charging1;
     m_micTx[0].muted = m_micTx[0].online && muted1;
-    m_micTx[1].battery = m_micTx[1].online ? batt2 : -1;
+    m_micTx[1].battery = batteryOf(m_micTx[1].online, batt2);
     m_micTx[1].charging = m_micTx[1].online && charging2;
     m_micTx[1].muted = m_micTx[1].online && muted2;
     emit micChanged();

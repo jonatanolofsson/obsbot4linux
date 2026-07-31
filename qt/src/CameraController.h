@@ -183,7 +183,14 @@ public:
     bool previewAvailable() const { return m_previewAvailable; }
 
     QVariantList micTxList() const;
-    int micButtonAction() const { return m_micButtonDevice < 0 ? 0 : m_micButtonDevice; }
+    // While a change is in flight, show what the user picked: the camera lags a
+    // command by up to a status cycle, so reporting the device value straight
+    // away makes the selector snap back and look broken. Mirrors the AI-toggle
+    // pending idiom (aiTracking()).
+    int micButtonAction() const {
+        if (m_micButtonTarget >= 0) return m_micButtonTarget;
+        return m_micButtonDevice < 0 ? 0 : m_micButtonDevice;
+    }
     QString micButtonActionName() const;
     bool capMicButton() const { return m_capMicButton; }
 
@@ -235,7 +242,10 @@ public slots:
     // wireless mic (Vox SE) — tx is 1-based (1 or 2), which is also the SDK's
     // DevTXType value. The worker wakes the camera before pairing: a sleeping
     // Tiny 3 ACKs the command and never scans.
-    void micPairTx(int tx);          // open pairing for a transmitter slot
+    // Open pairing. No slot argument: the camera picks the slot itself (see the
+    // implementation note) — offering a per-slot choice would be inventing a
+    // capability the hardware does not have.
+    void micPair();
     void micClearPairing(int tx);    // forget the mic linked to a slot
     // Assign the multi-function button. Persists always, and pushes to the
     // device when the runtime probe says it will listen.
@@ -283,7 +293,7 @@ private:
     // Delayed, guarded push of the managed power/sleep settings (see impl).
     void applyPowerSettings(const QString &why);
     // Raise the in-flight cue for a mic pair/clear, with a safety timeout.
-    void micPairBusyCue();
+    void micPairBusyCue(int timeoutMs);
 
     QThread m_thread;
     CameraWorker *m_worker = nullptr;
@@ -345,9 +355,16 @@ private:
     bool m_micTwsMode = false;   // status push: BT TWS mode instead of 2.4G mic mode
     bool m_micPairing = false;   // status push: the camera is in pairing mode
     bool m_micScanning = false;  // status push: the camera is scanning for a mic
-    bool m_micPairBusy = false;  // OUR pair/clear command is in flight
+    bool m_micPairBusy = false;
+    // Bumped on every new cue so a stale timeout cannot cancel a newer wait.
+    quint64 m_micPairCueGen = 0;  // OUR pair/clear command is in flight
     int m_micPairRecord = -1;    // has_pair_record (0/1, -1 unknown)
     int m_micButtonDevice = -1;  // device-reported DevTWSKeyType (-1 unknown)
+    // Optimistic value while a set is in flight (-1 = none). Cleared when the
+    // device confirms it, or by m_micButtonTimer so a lost/ignored command can
+    // never leave the selector lying indefinitely.
+    int m_micButtonTarget = -1;
+    QTimer *m_micButtonTimer = nullptr;
     bool m_capMicButton = false; // runtime probe: cameraGetTWSInfoR answered OK
 
     bool m_previewAvailable = false;

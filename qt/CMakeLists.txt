@@ -65,6 +65,7 @@ qt_add_qml_module(obsbot4linux
         qml/ImagePage.qml
         qml/TrackingPage.qml
         qml/PresetsPage.qml
+        qml/MicPage.qml
         qml/SettingsPage.qml
         qml/LogPage.qml
 )

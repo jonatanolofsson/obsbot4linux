@@ -30,7 +30,7 @@ ApplicationWindow {
     // immediately rather than relying solely on the drag-release/deadman paths.
     onActiveChanged: if (!active) cam.gimbalStop()
 
-    readonly property var pageTitles: ["Live Control", "Image & Exposure", "AI Tracking", "Presets", "Settings", "Activity Log"]
+    readonly property var pageTitles: ["Live Control", "Image & Exposure", "AI Tracking", "Presets", "Wireless Mic", "Settings", "Activity Log"]
 
     ListModel { id: logModel }
 
@@ -93,6 +93,7 @@ ApplicationWindow {
                 ImagePage {}
                 TrackingPage {}
                 PresetsPage {}
+                MicPage {}
                 SettingsPage {}
                 LogPage { logModel: logModel }
             }
