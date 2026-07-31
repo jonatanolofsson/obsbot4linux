@@ -9,33 +9,54 @@ Linux** (recent glibc) — no old-distro compatibility shims.
 > loads the full GUI headless with no errors; `--self-test` runs discovery +
 > clean shutdown against the bundled SDK). Just `chmod +x` and run it.
 
-## Build it (one command, on a real desktop)
+## Build it
+
+```sh
+qt/packaging/build-appimage-container.sh
+```
+
+Output: `dist/OBSBOT4Linux-x86_64.AppImage`. Then:
+
+```sh
+chmod +x dist/OBSBOT4Linux-x86_64.AppImage
+./dist/OBSBOT4Linux-x86_64.AppImage            # runs on KDE and GNOME
+./dist/OBSBOT4Linux-x86_64.AppImage --self-test
+```
+
+That wrapper builds `qt/packaging/Containerfile` (Ubuntu 22.04 + a pinned Qt via
+aqtinstall) and runs the real packaging script inside it. Needs `podman` or
+`docker` and nothing else; the first run downloads Qt and takes several minutes,
+after which the image is cached.
+
+**Use the container for anything you intend to ship.** The base image is the
+oldest distro that can still host the build, and that floor is set by the OBSBOT
+SDK — `libdev.so` needs `GLIBC_2.34` / `GLIBCXX_3.4.30`. An AppImage cannot run
+on a glibc older than the one it was built against, so building on a current
+host silently restricts the artifact to hosts as new as yours, which surfaces
+much later as `GLIBC_2.xx not found` on someone else's machine.
+
+### Building directly on the host (development only)
 
 ```sh
 qt/packaging/build-appimage.sh
 ```
 
-Output: `OBSBOT4Linux-x86_64.AppImage` in the repo root. Then:
+This is what the container runs, and it is fine for a quick local check — but it
+only works where **both** Qt 6 dev packages and the full desktop X11/GL *client*
+stack are installed, and it inherits the host's glibc floor.
 
-```sh
-chmod +x OBSBOT4Linux-x86_64.AppImage
-./OBSBOT4Linux-x86_64.AppImage            # runs on KDE and GNOME
-./OBSBOT4Linux-x86_64.AppImage --self-test
-```
-
-The script: builds Release → installs into an `AppDir` → bundles `libdev.so` →
-runs `linuxdeploy` + the Qt plugin (which auto-scans `qml/` for the QML modules to
-include) → emits the AppImage. It downloads `linuxdeploy`, `linuxdeploy-plugin-qt`
-and `appimagetool` into `qt/packaging/tools/` on first run.
-
-### Requirements on the build machine
 - `cmake`, a C++ compiler, and **Qt 6 dev** (`qmake` on PATH).
   - Arch/CachyOS: `sudo pacman -S --needed cmake qt6-base qt6-declarative`
-- Standard desktop X11/xcb client libraries (present on any KDE/GNOME install) —
-  the Qt `xcb` platform plugin links them. On a **headless** box they may be
-  missing (e.g. `libxcb-cursor.so.0`) and the deploy step will say
-  `Could not find dependency: …` — build on a normal desktop instead.
+- Desktop X11/xcb client libraries. `linuxdeploy` walks the Qt platform plugin's
+  ELF dependencies, so a missing one aborts the deploy step with
+  `Could not find dependency: …` (e.g. `libGLX.so.0`, `libxcb-cursor.so.0`).
 - Non-PATH Qt (e.g. an aqt install): pass `QMAKE=… CMAKE_PREFIX_PATH=…`.
+
+> The repo's **nix dev shell is not a packaging environment**. `nix develop`
+> gives a Qt 6 toolchain for building and running the app, but deliberately
+> omits the X11/GL client libraries, so `build-appimage.sh` under it always
+> fails at the deploy step with `Could not find dependency: libGLX.so.0`. Use
+> the container.
 
 ### Platform: xcb by default (runs everywhere)
 The AppImage ships the **xcb** platform plugin, which runs natively under X11 and
@@ -68,17 +89,17 @@ Override with `OBSBOT4LINUX_CONFIG=/path`.
 `icons/obsbot4linux.svg` (source) + PNGs at 16–512 px, regenerable with
 `python packaging/make_icon.py` (needs Pillow). The coral OBSBOT ring on obsidian.
 
-## Sandbox build note
+## glibc floor
 
-The prebuilt `dist/` AppImage was assembled in a headless CI VM. That box lacks a
-few X11/xcb client libs the Qt `xcb` plugin bundles (`libxcb-cursor.so.0`,
-`libxkbcommon-x11.so.0`, …) — on a **normal desktop these are already installed**,
-so `build-appimage.sh` just works. To reproduce in a headless environment, stage
-the missing libs onto `LD_LIBRARY_PATH` before running (they were pulled from the
-distro's own runtime + the `libxcb-cursor0` package). On a real KDE/GNOME desktop
-you don't need any of that.
+An AppImage runs only on a glibc at least as new as the one it was built
+against, so the build environment decides how far the artifact travels. The
+container pins that to **Ubuntu 22.04**, which is not a preference — it is the
+oldest base the OBSBOT SDK loads on (`libdev.so` needs `GLIBC_2.34` and
+`GLIBCXX_3.4.30`).
 
-Built against Ubuntu's current glibc; runs on modern rolling distros (CachyOS/
-Arch). If a target has an older glibc than the build host, rebuild there.
+Build on a current rolling distro instead and the artifact inherits *that*
+glibc, which fails on anything older with `GLIBC_2.xx not found` — reported by
+users, not by the build, which succeeds either way. That is the whole reason
+`build-appimage-container.sh` exists.
 
 A Flatpak manifest can be added later if Flathub distribution is wanted.

@@ -1,0 +1,120 @@
+# Build environment for the AppImage.
+#
+# WHY A CONTAINER AT ALL. An AppImage can only run on a glibc at least as new as
+# the one it was built against, so the base image is the OLDEST distro that can
+# still host the build — and that floor is set by the OBSBOT SDK, not by us:
+# libdev.so needs GLIBC_2.34 and GLIBCXX_3.4.30, which is Ubuntu 22.04. Building
+# on the host instead pins the artifact to the host's glibc and it stops running
+# on anything older.
+#
+# WHY NOT THE NIX DEV SHELL. flake.nix gives a Qt 6 toolchain for developing, and
+# `qt/packaging/build-appimage.sh` runs fine under it right up to the deploy step
+# — where linuxdeploy-plugin-qt walks the Qt platform plugin's ELF dependencies
+# and dies with "Could not find dependency: libGLX.so.0". Those X11/GL client
+# libraries are deliberately absent from the nix shell (they are the host's job,
+# and the AppImage must not bundle them — see the excludelist pruning in
+# build-appimage.sh). The container has them as ordinary system packages.
+#
+# Pinned Qt: the AppImage ships this Qt, so bumping it changes what users run.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        desktop-file-utils \
+        file \
+        git \
+        ninja-build \
+        patchelf \
+        pkg-config \
+        python3-pip \
+        python3-venv \
+        xz-utils \
+        zsync \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG QT_VERSION=6.8.3
+ARG AQT_VERSION=3.3.0
+ARG QT_ARCH=linux_gcc_64
+# qtmultimedia: the input level meter. qtshadertools + qtimageformats: required
+# by Qt Quick and by the MJPG preview decode respectively.
+ARG QT_MODULES="qtmultimedia qtshadertools qtimageformats"
+
+# Ubuntu 22.04 ships Qt 5 only, so Qt 6 comes from the official online installer
+# archives via aqtinstall rather than from apt.
+RUN pip3 install --no-cache-dir "aqtinstall==${AQT_VERSION}"
+RUN aqt install-qt linux desktop "${QT_VERSION}" "${QT_ARCH}" \
+        -m ${QT_MODULES} -O /opt/Qt \
+    && rm -f /aqtinstall.log
+
+# The -dev packages Qt's own plugins link against. These are what the nix shell
+# lacks: without the xcb/GL family here, linuxdeploy cannot resolve the platform
+# plugin's dependencies and the deploy step aborts.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libasound2-dev \
+        libdbus-1-dev \
+        libegl1-mesa-dev \
+        libfontconfig1-dev \
+        libfreetype6-dev \
+        libgl1-mesa-dev \
+        libglib2.0-dev \
+        libglu1-mesa-dev \
+        libpulse-dev \
+        libvulkan-dev \
+        libwayland-dev \
+        wayland-protocols \
+        libx11-dev \
+        libx11-xcb-dev \
+        libxcb1-dev \
+        libxcb-cursor-dev \
+        libxcb-dri3-dev \
+        libxcb-glx0-dev \
+        libxcb-icccm4-dev \
+        libxcb-image0-dev \
+        libxcb-keysyms1-dev \
+        libxcb-present-dev \
+        libxcb-randr0-dev \
+        libxcb-render-util0-dev \
+        libxcb-shape0-dev \
+        libxcb-shm0-dev \
+        libxcb-sync-dev \
+        libxcb-util-dev \
+        libxcb-xfixes0-dev \
+        libxcb-xinerama0-dev \
+        libxcb-xinput-dev \
+        libxcb-xkb-dev \
+        libxext-dev \
+        libxfixes-dev \
+        libxi-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+        libxrandr-dev \
+        libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV QT_ROOT=/opt/Qt/${QT_VERSION}/gcc_64
+ENV QMAKE="${QT_ROOT}/bin/qmake" \
+    CMAKE_PREFIX_PATH="${QT_ROOT}" \
+    PATH="${QT_ROOT}/bin:${PATH}"
+# Nested AppImage tools (linuxdeploy, appimagetool) have no FUSE in a container.
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+
+# Fail at BUILD time, not three minutes into a package run, if the Qt install is
+# missing something the packaging script needs. Each of these has been a real
+# failure: no qmlimportscanner => the qt plugin bundles no QML; no libqjpeg =>
+# the preview decodes zero frames; no libqoffscreen => --self-test cannot run.
+RUN qmake -query QT_VERSION \
+    && test -f "${QT_ROOT}/libexec/qmlimportscanner" \
+    && test -f "${QT_ROOT}/plugins/imageformats/libqjpeg.so" \
+    && test -f "${QT_ROOT}/plugins/platforms/libqoffscreen.so" \
+    && test -f "${QT_ROOT}/plugins/platforms/libqxcb.so" \
+    && test -f "${QT_ROOT}/plugins/platforms/libqwayland-generic.so" \
+    && test -f "${QT_ROOT}/plugins/multimedia/libffmpegmediaplugin.so" \
+    && test -f "${QT_ROOT}/lib/libQt6Multimedia.so"
+
+WORKDIR /src

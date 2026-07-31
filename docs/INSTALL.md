@@ -124,12 +124,18 @@ QT_QPA_PLATFORM=offscreen ./qt/build/obsbot4linux   # load the full UI headless
 ### Build your own AppImage
 
 ```sh
-qt/packaging/build-appimage.sh        # → dist/OBSBOT4Linux-x86_64.AppImage
+qt/packaging/build-appimage-container.sh   # → dist/OBSBOT4Linux-x86_64.AppImage
 ```
 
-On a normal desktop this needs no extra setup; it bundles Qt + the SDK and prunes
-host GL/X11 libraries so the target's own drivers are used. See
-`qt/packaging/README.md` for details and options (e.g. `WITH_WAYLAND=1`).
+Needs `podman` or `docker`; the first run downloads Qt and takes a few minutes,
+then the image is cached. It bundles Qt + the SDK and prunes host GL/X11
+libraries so the target's own drivers are used.
+
+The container is what makes the result portable: an AppImage only runs on a
+glibc at least as new as the one it was built against, so building on a rolling
+distro produces something that fails on older systems. `build-appimage.sh` runs
+the same steps directly on the host if you just want a local build — see
+`qt/packaging/README.md` for that and other options (e.g. `WITH_WAYLAND=1`).
 
 ---
 
