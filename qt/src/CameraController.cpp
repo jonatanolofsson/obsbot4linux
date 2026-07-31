@@ -31,6 +31,10 @@ constexpr int kAiReturnDelayMs = 1500;
 // duty period (15 s) so the hint can't miss just because the telltale push
 // arrived at the next duty tick (review finding).
 constexpr qint64 kAiDisengageHintMs = 20000;
+// Safety net for the mic pair/clear busy cue. Longer than the worker's
+// wake-settle delay plus a round trip, so a normal command always clears the cue
+// via its result and this only fires if one is never answered.
+constexpr int kMicPairCueMaxMs = 12000;
 } // namespace
 
 CameraController::CameraController(QObject *parent) : QObject(parent) {
@@ -65,6 +69,9 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     connect(m_worker, &CameraWorker::imageParams, this, &CameraController::onImageParams);
     connect(m_worker, &CameraWorker::commandResult, this, &CameraController::onWorkerResult);
     connect(m_worker, &CameraWorker::presetCaptured, this, &CameraController::onPresetCaptured);
+    connect(m_worker, &CameraWorker::micStatus, this, &CameraController::onMicStatus);
+    connect(m_worker, &CameraWorker::twsInfo, this, &CameraController::onTwsInfo);
+    connect(m_worker, &CameraWorker::micAudioSelect, this, &CameraController::onMicAudioSelect);
 
     m_thread.start();
 }
@@ -161,6 +168,40 @@ QVariantList CameraController::presets() const {
     return out;
 }
 
+// One map per transmitter slot for the Mic page's Repeater — built exactly like
+// presets() above. tx is 1-based (index+1); battery -1 means "unknown". No name
+// or firmware key: the official SDK exposes no source for either (see MicTx).
+QVariantList CameraController::micTxList() const {
+    QVariantList out;
+    for (int i = 0; i < 2; ++i) {
+        const MicTx &t = m_micTx[i];
+        QVariantMap m;
+        m["tx"] = i + 1;
+        m["online"] = t.online;
+        m["battery"] = t.battery;
+        m["charging"] = t.charging;
+        m["muted"] = t.muted;
+        out.append(m);
+    }
+    return out;
+}
+
+// The index IS Device::DevTWSKeyType — these are the official header's own
+// descriptions of DevTWSKeyTrack / TrackSwitch / ZoomX1 / Record.
+static QString micButtonName(int idx) {
+    switch (idx) {
+    case 0:  return QStringLiteral("Trigger tracking");
+    case 1:  return QStringLiteral("Switch tracking target");
+    case 2:  return QStringLiteral("Zoom to 1.0×");
+    case 3:  return QStringLiteral("PC recording");
+    default: return QStringLiteral("Action %1").arg(idx);   // honest, never blank
+    }
+}
+
+QString CameraController::micButtonActionName() const {
+    return m_micButtonDevice < 0 ? QStringLiteral("—") : micButtonName(m_micButtonDevice);
+}
+
 void CameraController::persist() {
     if (!Settings::save(m_settings))
         emit logLine("warn", QStringLiteral("settings: failed to write %1").arg(Settings::configPath()));
@@ -218,6 +259,21 @@ void CameraController::setMicSleepIndex(int idx) {
                                   Q_ARG(bool, idx == 2));
     else if (idx == 0)
         emit logLine("sys", QStringLiteral("mic during sleep: not managed by this app (camera keeps its CURRENT setting — nothing is restored)"));
+}
+
+// The index IS Device::DevTWSKeyType (0=Track, 1=Switch track, 2=Zoom 1x,
+// 3=Record). The CAMERA owns this setting, so there is nothing to persist: we
+// just send it, and the resulting DevTWSInfo readback updates the UI. Sending
+// unconditionally is deliberate — re-picking the current segment is the user's
+// way of saying "make it so" when the device disagrees with the selector.
+void CameraController::setMicButtonAction(int idx) {
+    idx = idx < 0 ? 0 : (idx > 3 ? 3 : idx);   // clamp to the fixed action table (0..3)
+    if (!connected() || !m_capMicButton) {
+        emit logLine("warn", QStringLiteral("mic button: camera does not expose the mic API"));
+        return;
+    }
+    QMetaObject::invokeMethod(m_worker, "cmdSetMicButtonAction", Qt::QueuedConnection,
+                              Q_ARG(int, idx));
 }
 
 // Push the MANAGED power/sleep settings ("Device"=0 is never sent) to the
@@ -525,6 +581,40 @@ void CameraController::saveCurrentToNextEmpty() {
 }
 
 // ---------------------------------------------------------------------------
+// Wireless mic (Vox SE) — pairing
+//
+// The Vox SE links to the CAMERA, not to this app: the mic must be held in its
+// own pairing mode (button ~6 s, light flashing green) while the camera has the
+// slot open. The worker also wakes the camera first — a sleeping Tiny 3 ACKs the
+// pair command with rc=0 and never scans, which is what made this look
+// unsupported at first. Success shows up as the slot going online in the status
+// push, not as the command's rc.
+// ---------------------------------------------------------------------------
+void CameraController::micPairTx(int tx) {
+    if (tx != 1 && tx != 2) return;
+    micPairBusyCue();
+    QMetaObject::invokeMethod(m_worker, "cmdTxPair", Qt::QueuedConnection,
+                              Q_ARG(int, tx), Q_ARG(bool, true));
+}
+
+void CameraController::micClearPairing(int tx) {
+    if (tx != 1 && tx != 2) return;
+    micPairBusyCue();
+    QMetaObject::invokeMethod(m_worker, "cmdTxClear", Qt::QueuedConnection, Q_ARG(int, tx));
+}
+
+// Busy cue for an in-flight pair/clear. Cleared by the command's result; the
+// timeout is only a safety net so the cue can never stick (the worker may defer
+// the real command by a wake-settle delay).
+void CameraController::micPairBusyCue() {
+    m_micPairBusy = true;
+    emit micChanged();
+    QTimer::singleShot(kMicPairCueMaxMs, this, [this]() {
+        if (m_micPairBusy) { m_micPairBusy = false; emit micChanged(); }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Worker signal handlers (GUI thread)
 // ---------------------------------------------------------------------------
 void CameraController::onConnectionResolved(bool found, const QString &product, const QString &sn,
@@ -591,11 +681,21 @@ void CameraController::onDeviceLost(const QString &reason) {
     m_autoSleepDevice = -1;
     m_hadDevice = false;   // a real loss: the next connect is genuine → preset re-fires
     m_zoomValid = false;
+    m_micTx[0] = MicTx{};   // no device: transmitter state is unknown again (honesty)
+    m_micTx[1] = MicTx{};
+    m_micTwsMode = false;
+    m_micPairing = false;
+    m_micScanning = false;
+    m_micPairBusy = false;
+    m_micPairRecord = -1;
+    m_micButtonDevice = -1;
+    m_capMicButton = false;   // re-probed on the next bind, never assumed
     emit connStateChanged();
     emit statusChanged();
     emit aiChanged();
     emit imageChanged();
     emit zoomChanged();
+    emit micChanged();
     emit logLine("warn", QStringLiteral("device lost: %1 — controls disabled").arg(reason));
 }
 
@@ -740,6 +840,12 @@ void CameraController::onWorkerResult(const QString &action, bool ok, int /*rc*/
         else    m_hdrOn = !m_targetHdr;   // revert
         m_hdrPending = false;             // toggle settled: allow status resync again
         emit imageChanged();
+    } else if (action.startsWith(QLatin1String("mic pair"))
+               || action.startsWith(QLatin1String("mic clear"))) {
+        // Command resolved (ok or not) — drop the in-flight cue. Note ok==true
+        // only means the camera accepted the request; the link itself is
+        // confirmed by the slot going online in onMicStatus.
+        if (m_micPairBusy) { m_micPairBusy = false; emit micChanged(); }
     }
     emit commandResult(action, ok, message);
 }
@@ -756,6 +862,65 @@ void CameraController::onPresetCaptured(int idx, double pitch, double yaw, doubl
     p.fov = (fov < 0) ? m_settings.fovIndex : fov;
     persist();
     emit presetsChanged();
+}
+
+// Presence, from the camera's own status push (tiny.wireless_mic). Authoritative
+// and free — nothing is polled for it.
+void CameraController::onMicStatus(bool tx1Online, bool tx2Online, bool twsMode,
+                                   bool pairing, bool scanning) {
+    if (m_micTx[0].online == tx1Online && m_micTx[1].online == tx2Online
+        && m_micTwsMode == twsMode && m_micPairing == pairing && m_micScanning == scanning)
+        return;   // status pushes every ~2-3 s; don't churn QML bindings for nothing
+    // A slot coming online is the one moment a fresh battery reading is worth a
+    // round trip — otherwise the 60 s refresh would leave it blank for a minute.
+    const bool cameOnline = (tx1Online && !m_micTx[0].online) || (tx2Online && !m_micTx[1].online);
+    m_micTx[0].online = tx1Online;
+    m_micTx[1].online = tx2Online;
+    m_micTwsMode = twsMode;
+    m_micPairing = pairing;
+    m_micScanning = scanning;
+    // A slot that just went offline has no battery to report any more.
+    for (MicTx &t : m_micTx) {
+        if (!t.online) { t.battery = -1; t.charging = false; t.muted = false; }
+    }
+    emit micChanged();
+    if (cameOnline && m_capMicButton && connected())
+        QMetaObject::invokeMethod(m_worker, "cmdReadTwsInfo", Qt::QueuedConnection);
+}
+
+// Detail, from Device::cameraGetTWSInfoR (see ObsbotTwsCompat.h). `supported`
+// is the runtime capability probe — false means the call is unavailable on this
+// build/firmware and the UI must say so instead of showing invented zeroes.
+void CameraController::onTwsInfo(bool supported, int keyCmd,
+                                 int batt1, bool charging1, bool muted1,
+                                 int batt2, bool charging2, bool muted2) {
+    m_capMicButton = supported;
+    if (!supported) {
+        m_micButtonDevice = -1;
+        for (MicTx &t : m_micTx) { t.battery = -1; t.charging = false; t.muted = false; }
+        emit micChanged();
+        return;
+    }
+    m_micButtonDevice = (keyCmd >= 0 && keyCmd <= 3) ? keyCmd : -1;
+    // The battery bytes only mean something for a slot the camera says is
+    // online — an empty slot keeps whatever was last written there.
+    m_micTx[0].battery = m_micTx[0].online ? batt1 : -1;
+    m_micTx[0].charging = m_micTx[0].online && charging1;
+    m_micTx[0].muted = m_micTx[0].online && muted1;
+    m_micTx[1].battery = m_micTx[1].online ? batt2 : -1;
+    m_micTx[1].charging = m_micTx[1].online && charging2;
+    m_micTx[1].muted = m_micTx[1].online && muted2;
+    emit micChanged();
+}
+
+// has_pair_record is the "this camera has never had a mic paired" diagnostic;
+// the other two fields are informational (auto audio-source selection).
+void CameraController::onMicAudioSelect(int hasPairRecord, int isAuto, int supportAuto) {
+    Q_UNUSED(isAuto);
+    Q_UNUSED(supportAuto);
+    if (hasPairRecord == m_micPairRecord) return;
+    m_micPairRecord = hasPairRecord;
+    emit micChanged();
 }
 
 void CameraController::scheduleStartupPreset(const QString &why) {

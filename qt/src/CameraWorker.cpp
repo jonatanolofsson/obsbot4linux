@@ -8,6 +8,8 @@
 
 #include <dev/devs.hpp>
 
+#include "ObsbotTwsCompat.h"
+
 namespace {
 
 // Gimbal safety clamps (degrees) — identical bounds to the validated GTK PoC.
@@ -21,6 +23,16 @@ constexpr qint64 kAiOffGraceMs = 4000;
 // refresh becomes a short enable→one push→disable duty cycle, leaving the USB
 // control channel quiet ~90+% of the time.
 constexpr int kStatusDutyMs = 15000;
+// Wireless-mic DETAIL refresh cadence. Deliberately slow: mic presence arrives
+// free with the status push, so this single cameraGetTWSInfoR call only exists
+// to keep battery/mute fresh. Same recognizer concern that drives the
+// gesture-friendly cadence — keep the control channel quiet.
+constexpr int kTwsInfoPollMs = 60000;
+// Settle delay between waking the camera and issuing a pairing command. A
+// sleeping Tiny 3 answers rc=0 but never powers its mic radio (hardware
+// finding), so pairing always runs awake — this gives the wake a moment to
+// take effect without blocking the worker's event loop.
+constexpr int kPairWakeSettleMs = 1200;
 
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -92,6 +104,17 @@ void CameraWorker::init() {
         m_awaitingDutyPush = true;
         m_dev->enableDevStatusCallback(true);
     });
+
+    // Wireless-mic detail refresh: one cameraGetTWSInfoR per minute while a
+    // device is bound AND the camera answered the probe. Silent (no logLine) —
+    // it's a background read, not a user command. Started in bindDevice (after
+    // the probe succeeds), stopped in shutdown.
+    m_twsInfoTimer = new QTimer(this);
+    m_twsInfoTimer->setInterval(kTwsInfoPollMs);
+    connect(m_twsInfoTimer, &QTimer::timeout, this, [this]() {
+        if (m_shuttingDown || !m_dev || m_quiet || !m_twsSupported) return;
+        cmdReadTwsInfo();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +179,8 @@ void CameraWorker::pollTick() {
 void CameraWorker::bindDevice(const std::shared_ptr<Device> &d) {
     m_dev = d;
     m_sn = QString::fromStdString(d->devSn());
+    m_twsSupported = false;   // re-probed below; never carried over from a previous device
+    m_twsProbed = false;
 
     const QString product = productName(d->productType());
     const QString fw = QString::fromStdString(d->devVersion());
@@ -173,6 +198,15 @@ void CameraWorker::bindDevice(const std::shared_ptr<Device> &d) {
     // Read real zoom + current image params once now (blocking getters, safe here).
     refreshZoom();
     cmdReadImageParams();
+
+    // Wireless mic: probe the undocumented TWS API once (cmdReadTwsInfo sets
+    // m_twsSupported from the rc and emits the result either way), then keep
+    // battery/mute fresh on the slow timer if the camera answered. Presence
+    // itself needs nothing here — it rides the status push.
+    cmdReadTwsInfo();
+    if (m_twsSupported) m_twsInfoTimer->start();
+
+    cmdReadAudioSelect();
 }
 
 // ---------------------------------------------------------------------------
@@ -190,13 +224,22 @@ void CameraWorker::sdkStatusTrampoline(void *param, const void *data) {
     const int fps = st->tiny.fps;                // current video stream fps
     const int sleepMicro = st->tiny.sleep_micro; // mic during sleep 0/1 (readback for cmdSetMicSleep)
     const int autoSleep = st->tiny.auto_sleep_time; // seconds, 0=never (readback for cmdSetAutoSleep)
+    // Wireless mic (Vox SE) — the AUTHORITATIVE presence signal, and public/
+    // documented, so no undocumented call is needed for it. Copied out of the
+    // callback's buffer in the device's own bit order (see the header):
+    // bit0 is_tws_mode, bits1-2 tx_state, bit3 is_pairing, bit4 is_scanning.
+    const auto &wm = st->tiny.wireless_mic;
+    const int micBits = (wm.is_tws_mode ? 1 << 0 : 0)
+                        | ((wm.tx_state & 0x3) << 1)
+                        | (wm.is_pairing ? 1 << 3 : 0)
+                        | (wm.is_scanning ? 1 << 4 : 0);
     // Do NOT touch SDK/Qt state here — just marshal onto the worker thread.
     QMetaObject::invokeMethod(
-        self, [self, run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep]() { self->onSdkStatus(run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep); },
+        self, [self, run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep, micBits]() { self->onSdkStatus(run, ai, face, hdr, hdrSup, fps, sleepMicro, autoSleep, micBits); },
         Qt::QueuedConnection);
 }
 
-void CameraWorker::onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec) {
+void CameraWorker::onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec, int micBits) {
     if (m_shuttingDown || !m_dev) return;
     // Gesture-friendly cadence: this push is the duty cycle's one shot — close
     // the window again so the control channel goes quiet for the recognizer.
@@ -240,6 +283,14 @@ void CameraWorker::onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr
     const bool zok = (m_dev->cameraGetZoomAbsoluteR(z) == RM_RET_OK);
     emit statusUpdate(runStateFromDev(runStatus), aiMode, z, zok);
     emit auxStatus(faceFocus != 0, hdr != 0, hdrSupport != 0, fps, sleepMicro, autoSleepSec);
+
+    // Wireless-mic presence. tx_state is a 2-bit mask: bit0 => slot 1 online,
+    // bit1 => slot 2 online (00 none, 11 both).
+    const int txState = (micBits >> 1) & 0x3;
+    emit micStatus((txState & 0x1) != 0, (txState & 0x2) != 0,
+                   (micBits & (1 << 0)) != 0,
+                   (micBits & (1 << 3)) != 0,
+                   (micBits & (1 << 4)) != 0);
 }
 
 void CameraWorker::onDevChanged(const QString &sn, bool plugged) {
@@ -251,6 +302,8 @@ void CameraWorker::onDevChanged(const QString &sn, bool plugged) {
             if (m_dev) m_dev->enableDevStatusCallback(false);
             m_dev.reset();
             m_aiTracking = false;
+            m_twsSupported = false;
+            if (m_twsInfoTimer) m_twsInfoTimer->stop();
             emit deviceLost(QStringLiteral("USB unplug"));
         }
     } else if (!m_dev) {
@@ -632,6 +685,163 @@ void CameraWorker::cmdPresetGo(int idx, double pitch, double yaw, double zoom, i
 }
 
 // ---------------------------------------------------------------------------
+// Wireless mic (OBSBOT Vox SE)
+//
+// Presence is handled entirely by onSdkStatus (tiny.wireless_mic). What is left
+// is the detail read and the button assignment, both of which go through
+// ObsbotTwsCompat.h — libdev exports them, the public header does not declare
+// them, so they are bound by symbol name and probed at runtime.
+// ---------------------------------------------------------------------------
+
+// SILENT — no requireDevice, no logLine: this runs on bind and on a 60 s timer.
+// Doubles as the capability probe: rc == RM_RET_OK means this firmware answers
+// the undocumented TWS API, and only then are the extras advertised to the UI.
+void CameraWorker::cmdReadTwsInfo() {
+    if (!m_dev) return;
+    Device::DevTWSInfo info{};
+    const int rc = ObsbotTws::getInfo(m_dev.get(), info);
+    const bool ok = (rc == RM_RET_OK);
+    if (!m_twsProbed || ok != m_twsSupported) {
+        m_twsProbed = true;
+        m_twsSupported = ok;
+        emit logLine(ok ? "sys" : "warn",
+                     ok ? QStringLiteral("wireless mic: extended mic API available (cameraGetTWSInfoR)")
+                        : QStringLiteral("wireless mic: extended mic API unavailable on this camera/firmware "
+                                         "(cameraGetTWSInfoR rc=%1) — battery and button assignment disabled").arg(rc));
+    }
+    if (!ok) {
+        emit twsInfo(false, -1, -1, false, false, -1, false, false);
+        return;
+    }
+    emit twsInfo(true, static_cast<int>(info.key_cmd),
+                 static_cast<int>(info.mic1_batt_level), info.mic1_chg_status != 0, info.mic_info.mic1_mute != 0,
+                 static_cast<int>(info.mic2_batt_level), info.mic2_chg_status != 0, info.mic_info.mic2_mute != 0);
+}
+
+// Assign the mic's multi-function button. Device::DevTWSKeyType maps 1:1 onto
+// the UI order (Track / Switch mode / Zoom 1x / Record), so the index IS the
+// enum value — no translation table, just a range check so nothing but a valid
+// enumerator is ever cast.
+void CameraWorker::cmdSetMicButtonAction(int idx) {
+    const QString a = QStringLiteral("mic button");
+    if (!requireDevice(a)) return;
+    if (idx < Device::DevTWSKeyTrack || idx > Device::DevTWSKeyRecord) {
+        emit commandResult(a, false, -1, QStringLiteral("invalid action %1").arg(idx));
+        emit logLine("warn", a + QStringLiteral(": invalid action %1 (expected 0..3)").arg(idx));
+        return;
+    }
+    emit logLine("cmd", QStringLiteral("→ mic button = %1").arg(idx));
+    const int rc = ObsbotTws::setKeyType(m_dev.get(), static_cast<Device::DevTWSKeyType>(idx));
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, ok ? QStringLiteral("applied") : QStringLiteral("failed"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("mic button = %1  rc=%2").arg(idx).arg(rc));
+    statusPulse();
+    cmdReadTwsInfo();   // confirm from the device rather than trusting rc alone
+}
+
+// Diagnostic read: has_pair_record == 0 means this camera has never had a
+// wireless mic paired to it, which is the usual reason both slots read "not
+// connected" forever. Silent (no logLine on the failure path) — it runs on bind
+// and after pair/clear, never on a timer.
+void CameraWorker::cmdReadAudioSelect() {
+    if (!m_dev) return;
+    Device::AudioSelectAttr audio{};
+    if (ObsbotTws::getAudioSelect(m_dev.get(), audio) != RM_RET_OK) {
+        emit micAudioSelect(-1, -1, -1);
+        return;
+    }
+    emit micAudioSelect(audio.has_pair_record ? 1 : 0, audio.is_auto ? 1 : 0, audio.support_auto ? 1 : 0);
+    emit logLine("sys", QStringLiteral("wireless mic: pairing record %1 (auto source-select %2, supported %3)")
+                            .arg(audio.has_pair_record ? "present"
+                                                       : "NONE — no mic has ever been paired to this camera",
+                                 audio.is_auto ? "on" : "off",
+                                 audio.support_auto ? "yes" : "no"));
+}
+
+// The camera must be AWAKE for a pairing command to do anything: asleep it
+// answers rc=0 and never powers its mic radio (hardware finding — the reason
+// pairing was first, wrongly, written off as unsupported). Returns TRUE if the
+// camera was ALREADY awake; FALSE means a wake was just issued and the caller
+// should let it settle before touching the radio.
+bool CameraWorker::wakeForMic(const QString &action) {
+    if (!m_dev) return true;   // caller already bailed via requireDevice
+    if (m_dev->cameraStatus().tiny.dev_status == Device::DevStatusRun) return true;
+    emit logLine("warn", action + QStringLiteral(": camera was asleep — woke it first "
+                                                 "(a sleeping Tiny 3 accepts pairing commands it never acts on)"));
+    const int rc = m_dev->cameraSetDevRunStatusR(Device::DevStatusRun);
+    if (rc != RM_RET_OK)
+        emit logLine("warn", action + QStringLiteral(": wake rc=%1 — pairing may not take").arg(rc));
+    statusPulse();
+    return false;
+}
+
+// Put a transmitter slot into pairing mode. tx is 1-based and IS the SDK's
+// DevTXType value (DevTX1 = 1). Wakes the camera first when needed, then runs
+// the real command after a short settle — never blocking the worker's loop.
+void CameraWorker::cmdTxPair(int tx, bool enable) {
+    const QString a = QStringLiteral("mic pair tx%1").arg(tx);
+    if (!requireDevice(a)) return;
+    if (tx != Device::DevTX1 && tx != Device::DevTX2) {
+        emit commandResult(a, false, -1, QStringLiteral("invalid transmitter slot"));
+        emit logLine("warn", a + QStringLiteral(": invalid transmitter slot %1 (expected 1 or 2)").arg(tx));
+        return;
+    }
+    emit logLine("cmd", QStringLiteral("→ %1 (%2)").arg(a, enable ? "enable" : "disable"));
+    if (wakeForMic(a)) {
+        sendTxPair(tx, enable);
+    } else {
+        // Give the wake a moment before the radio command. Context object is
+        // `this`, so a torn-down worker cancels the pending fire.
+        QTimer::singleShot(kPairWakeSettleMs, this, [this, tx, enable]() {
+            if (m_shuttingDown || !m_dev) return;
+            sendTxPair(tx, enable);
+        });
+    }
+}
+
+void CameraWorker::sendTxPair(int tx, bool enable) {
+    const QString a = QStringLiteral("mic pair tx%1").arg(tx);
+    if (!requireDevice(a)) return;
+    const auto slot = static_cast<Device::DevTXType>(tx);   // DevTXType is ONE-based
+    // Belt-and-braces: open/close the camera's generic BLE pairing window around
+    // the TX call. Both return rc=0 on a Tiny 3 but pairing has been observed to
+    // work without them, so their result is logged, never acted on.
+    if (enable) ObsbotTws::blePairingEnable(m_dev.get(), true, 1);
+    const int rc = ObsbotTws::setPairEnabled(m_dev.get(), slot, enable);
+    if (!enable) ObsbotTws::blePairingExit(m_dev.get());
+    const bool ok = (rc == RM_RET_OK);
+    // rc is NOT proof: the honest confirmation is wireless_mic.tx_state going
+    // non-zero in the status push, which lands in micStatus a few seconds later.
+    emit commandResult(a, ok, rc,
+                       ok ? (enable ? QStringLiteral("pairing open — hold the mic's button until it flashes green")
+                                    : QStringLiteral("pairing closed"))
+                          : QStringLiteral("failed"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("%1  rc=%2%3").arg(a).arg(rc)
+                                         .arg(ok && enable ? QStringLiteral(" — waiting for the camera to report the link")
+                                                           : QString()));
+    statusPulse();       // pull the tx_state readback forward in low-traffic mode
+    cmdReadAudioSelect();
+}
+
+void CameraWorker::cmdTxClear(int tx) {
+    const QString a = QStringLiteral("mic clear tx%1").arg(tx);
+    if (!requireDevice(a)) return;
+    if (tx != Device::DevTX1 && tx != Device::DevTX2) {
+        emit commandResult(a, false, -1, QStringLiteral("invalid transmitter slot"));
+        emit logLine("warn", a + QStringLiteral(": invalid transmitter slot %1 (expected 1 or 2)").arg(tx));
+        return;
+    }
+    emit logLine("cmd", QStringLiteral("→ %1").arg(a));
+    wakeForMic(a);   // same asleep-ACKs-but-ignores trap as pairing
+    const int rc = ObsbotTws::clearPairedInfo(m_dev.get(), static_cast<Device::DevTXType>(tx));
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, ok ? QStringLiteral("cleared") : QStringLiteral("failed"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("%1  rc=%2").arg(a).arg(rc));
+    statusPulse();
+    cmdReadAudioSelect();
+}
+
+// ---------------------------------------------------------------------------
 // PTZ velocity (hold-to-move) — see the header doc for the four safety stops.
 // ---------------------------------------------------------------------------
 void CameraWorker::cmdGimbalVelocity(double pitchSpeed, double yawSpeed) {
@@ -726,6 +936,7 @@ void CameraWorker::shutdown() {
     m_shuttingDown = true;
     if (m_pollTimer) m_pollTimer->stop();
     if (m_statusDutyTimer) m_statusDutyTimer->stop();
+    if (m_twsInfoTimer) m_twsInfoTimer->stop();
     if (m_velocityActive && m_dev) m_dev->gimbalSpeedCtrlR(0.0, 0.0, 0.0);   // stop any in-flight motion
     if (m_velocityWatchdog) m_velocityWatchdog->stop();
     if (m_dev) {

@@ -58,6 +58,34 @@ public slots:
     void cmdPresetCapture(int idx);
     void cmdPresetGo(int idx, double pitch, double yaw, double zoom, int fov, double speed);
 
+    // Wireless mic (OBSBOT Vox SE).
+    //
+    // PRESENCE comes for free from the SDK status push (CameraStatus's
+    // tiny.wireless_mic) — see onSdkStatus / the micStatus signal. Nothing is
+    // polled for it.
+    //
+    // BATTERY / mute / the current button assignment come from ONE call,
+    // Device::cameraGetTWSInfoR, which libdev exports but the public header
+    // does not declare — reached through ObsbotTwsCompat.h. cmdReadTwsInfo also
+    // doubles as the runtime capability probe (rc == RM_RET_OK => this
+    // firmware answers the undocumented API); its `supported` flag drives the
+    // UI's capMicButton gate. SILENT: no logLine, it also runs on a slow timer.
+    void cmdReadTwsInfo();
+    // Assign the mic's multi-function button: idx is the Device::DevTWSKeyType
+    // value 1:1 (0=Track, 1=Switch track, 2=Zoom 1x, 3=Record), validated 0..3.
+    void cmdSetMicButtonAction(int idx);
+    // PAIRING. tx is 1-based and IS Device::DevTXType (DevTX1 = 1 — the enum is
+    // one-based). HARDWARE FINDING: a sleeping Tiny 3 ACKs the pair command with
+    // rc=0 and never turns its radio on, so cmdTxPair wakes the camera first and
+    // says so in the log. rc is NOT proof of success — the honest confirmation is
+    // wireless_mic.tx_state going non-zero in the status push (micStatus).
+    void cmdTxPair(int tx, bool enable);
+    void cmdTxClear(int tx);
+    // Audio-source auto-select attributes (Device::cameraGetAudioSelectR). One
+    // cheap read; has_pair_record == 0 is the "no mic has ever been paired to
+    // this camera" diagnostic. Silent, emits micPairRecord.
+    void cmdReadAudioSelect();
+
     // VELOCITY (hold-to-move) PTZ — gated behind four safety stops, per the
     // design handoff: stop-on-release (caller stops sending on pointer-up),
     // stop-on-window-blur (CameraController::gimbalStop() wired to window
@@ -104,6 +132,25 @@ signals:
     void imageParams(int brightness, int contrast, int saturation, int sharpness);
     void commandResult(const QString &action, bool ok, int rc, const QString &message);
     void presetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
+    // Wireless-mic PRESENCE, straight from the status push's tiny.wireless_mic.
+    // tx1/tx2 are the two transmitter slots the camera reports online; twsMode
+    // distinguishes BT TWS mode from the Vox SE's 2.4 GHz mode; pairing/scanning
+    // are the camera's own link state.
+    void micStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning);
+    // Wireless-mic DETAIL from Device::cameraGetTWSInfoR (see ObsbotTwsCompat.h).
+    // supported=false means the call is unavailable on this build/firmware and
+    // every other field is meaningless — the UI must show "unavailable", not 0.
+    // battery is 0–100 (-1 unknown); keyCmd is the device's DevTWSKeyType.
+    // chargingN is "mic_chg_status != 0". The exact encoding is undocumented —
+    // a Tiny 3 was observed reporting 2 at 100 % — so the UI says "on charge"
+    // rather than claiming a charge RATE it cannot know.
+    void twsInfo(bool supported, int keyCmd,
+                 int batt1, bool charging1, bool muted1,
+                 int batt2, bool charging2, bool muted2);
+    // Device::cameraGetAudioSelectR readback. Each field is -1 when the call is
+    // unavailable, else 0/1. hasPairRecord == 0 means no mic has ever been
+    // paired to this camera.
+    void micAudioSelect(int hasPairRecord, int isAuto, int supportAuto);
 
 private:
     void pollTick();
@@ -114,6 +161,13 @@ private:
     // CODE_REVIEW #4: never log a fake "(ok)" for a move the device will ignore.
     bool aiOwnsGimbal(const QString &action);
     void refreshZoom();
+    // Wireless-mic pairing helpers. wakeForMic wakes a sleeping camera (and logs
+    // it) because a sleeping Tiny 3 ACKs pairing commands it never acts on; it
+    // returns true when the camera was ALREADY awake, false when a wake was just
+    // issued and the radio command should wait for it to settle. sendTxPair does
+    // the actual pair/unpair once the camera is known to be awake.
+    bool wakeForMic(const QString &action);
+    void sendTxPair(int tx, bool enable);
     // Gesture-friendly mode: open a one-push status window NOW (closed again by
     // onSdkStatus). Called after state-changing commands (wake/sleep/AI/preset)
     // so their effects reach the UI immediately instead of at the next duty
@@ -121,7 +175,10 @@ private:
     // The command itself just made traffic, so this pulse costs nothing extra
     // with respect to recognizer suppression.
     void statusPulse();
-    void onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec);
+    // micBits packs CameraStatus::tiny.wireless_mic (a 1-byte bitfield the SDK
+    // callback must not be trusted to keep alive) in the DEVICE's own bit order:
+    // bit0 is_tws_mode, bits1-2 tx_state, bit3 is_pairing, bit4 is_scanning.
+    void onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec, int micBits);
     void onDevChanged(const QString &sn, bool plugged);
 
     static void sdkStatusTrampoline(void *param, const void *data);
@@ -129,6 +186,15 @@ private:
     std::shared_ptr<Device> m_dev;
     QString m_sn;
     QTimer *m_pollTimer = nullptr;
+    // Slow (60 s) refresh of the wireless-mic DETAIL (battery/mute). Presence
+    // rides the status push and needs no polling, so this stays deliberately
+    // lazy; ticks are silent and are skipped while shutting down or in quiet
+    // mode so it never re-adds the USB traffic the gesture work removed.
+    QTimer *m_twsInfoTimer = nullptr;
+    // Runtime capability: the connected camera answered cameraGetTWSInfoR.
+    // m_twsProbed makes the FIRST verdict always log, including a negative one.
+    bool m_twsSupported = false;
+    bool m_twsProbed = false;
     int m_pollElapsedMs = 0;
     int m_pollTimeoutMs = 6000;
     bool m_devChangedRegistered = false;

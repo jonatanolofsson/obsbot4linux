@@ -103,6 +103,37 @@ class CameraController : public QObject {
     // for when QtMultimedia misbehaves on a given box.
     Q_PROPERTY(bool previewAvailable READ previewAvailable CONSTANT)
 
+    // ----- wireless mic (OBSBOT Vox SE) -----
+    // One map per transmitter slot (TX1/TX2) for the Mic page's Repeater — built
+    // exactly like presets(): { tx, online, battery, charging, muted }. `online`
+    // is the camera's own tx_state bit from the status push; the rest come from
+    // Device::cameraGetTWSInfoR and are only meaningful while capMicButton.
+    Q_PROPERTY(QVariantList micTxList READ micTxList NOTIFY micChanged)
+    // Link state, also straight from the status push: BT-TWS vs the Vox SE's
+    // 2.4 GHz mode, and whether the camera is currently pairing/scanning.
+    Q_PROPERTY(bool micTwsMode MEMBER m_micTwsMode NOTIFY micChanged)
+    Q_PROPERTY(bool micPairing MEMBER m_micPairing NOTIFY micChanged)
+    Q_PROPERTY(bool micScanning MEMBER m_micScanning NOTIFY micChanged)
+    // A pair/clear command of OURS is in flight (distinct from micPairing, which
+    // is the camera's own state). Drives the busy cue on the Mic page.
+    Q_PROPERTY(bool micPairBusy MEMBER m_micPairBusy NOTIFY micChanged)
+    // Device::cameraGetAudioSelectR's has_pair_record: 1 = a mic has been paired
+    // to this camera at some point, 0 = never, -1 = unknown/unavailable.
+    Q_PROPERTY(int micPairRecord MEMBER m_micPairRecord NOTIFY micChanged)
+    // The mic's multi-function button assignment (Device::DevTWSKeyType). The
+    // CAMERA stores this, so it is read back from the device rather than
+    // persisted here — no app-side copy means no UI-vs-device drift.
+    // micButtonAction falls back to 0 while unknown so the selector still has a
+    // valid index; micButtonActionName renders "—" until the device answers.
+    Q_PROPERTY(int micButtonAction READ micButtonAction WRITE setMicButtonAction NOTIFY micChanged)
+    Q_PROPERTY(QString micButtonActionName READ micButtonActionName NOTIFY micChanged)
+    // Capability gate, resolved at RUNTIME (hence NOTIFY, not CONSTANT): true
+    // once the bound camera answers Device::cameraGetTWSInfoR. That call is
+    // exported by libdev but absent from the public SDK header (see
+    // ObsbotTwsCompat.h), so a camera/firmware that ignores it must show the
+    // mic extras as unavailable rather than pretend.
+    Q_PROPERTY(bool capMicButton READ capMicButton NOTIFY micChanged)
+
 public:
     enum ConnState { Disconnected = 0, Discovering = 1, Connected = 2 };
     Q_ENUM(ConnState)
@@ -151,6 +182,11 @@ public:
     QVariantList presets() const;
     bool previewAvailable() const { return m_previewAvailable; }
 
+    QVariantList micTxList() const;
+    int micButtonAction() const { return m_micButtonDevice < 0 ? 0 : m_micButtonDevice; }
+    QString micButtonActionName() const;
+    bool capMicButton() const { return m_capMicButton; }
+
 public slots:
     // property setters (persist)
     void setMoveStepDeg(int deg);
@@ -196,6 +232,15 @@ public slots:
     void renamePreset(int idx, const QString &name);
     void saveCurrentToNextEmpty();
 
+    // wireless mic (Vox SE) — tx is 1-based (1 or 2), which is also the SDK's
+    // DevTXType value. The worker wakes the camera before pairing: a sleeping
+    // Tiny 3 ACKs the command and never scans.
+    void micPairTx(int tx);          // open pairing for a transmitter slot
+    void micClearPairing(int tx);    // forget the mic linked to a slot
+    // Assign the multi-function button. Persists always, and pushes to the
+    // device when the runtime probe says it will listen.
+    void setMicButtonAction(int idx);
+
 signals:
     void connStateChanged();
     void identityChanged();
@@ -208,6 +253,7 @@ signals:
     void logLine(const QString &kind, const QString &message);
     void commandResult(const QString &action, bool ok, const QString &message);
     void discoveryFinished(bool found);   // one-shot, used by --self-test
+    void micChanged();
 
 private slots:
     void onConnectionResolved(bool found, const QString &product, const QString &sn,
@@ -219,6 +265,11 @@ private slots:
     void onImageParams(int brightness, int contrast, int saturation, int sharpness);
     void onWorkerResult(const QString &action, bool ok, int rc, const QString &message);
     void onPresetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
+    void onMicStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning);
+    void onTwsInfo(bool supported, int keyCmd,
+                   int batt1, bool charging1, bool muted1,
+                   int batt2, bool charging2, bool muted2);
+    void onMicAudioSelect(int hasPairRecord, int isAuto, int supportAuto);
 
 private:
     double speedValue() const;   // speedMode -> gimbal reference speed
@@ -231,6 +282,8 @@ private:
     void scheduleStartupPreset(const QString &why);
     // Delayed, guarded push of the managed power/sleep settings (see impl).
     void applyPowerSettings(const QString &why);
+    // Raise the in-flight cue for a mic pair/clear, with a safety timeout.
+    void micPairBusyCue();
 
     QThread m_thread;
     CameraWorker *m_worker = nullptr;
@@ -281,6 +334,21 @@ private:
     int m_fps = 0;               // current video stream fps (from status)
     int m_micSleepDevice = -1;   // device-reported mic-during-sleep (readback; -1 unknown)
     int m_autoSleepDevice = -1;  // device-reported auto-sleep seconds (readback; -1 unknown, 0 never)
+
+    // Wireless mic (Vox SE) transmitter state, one entry per slot (TX1/TX2).
+    // `online` is pushed by the camera (tiny.wireless_mic.tx_state); battery/
+    // charging/muted come from Device::cameraGetTWSInfoR. battery -1 = unknown.
+    // NOTE: transmitter name and firmware are deliberately absent — the public
+    // SDK has no source for them (the old cameraTXGet* getters this feature was
+    // first written against do not exist in the official header).
+    struct MicTx { bool online = false; int battery = -1; bool charging = false; bool muted = false; } m_micTx[2];
+    bool m_micTwsMode = false;   // status push: BT TWS mode instead of 2.4G mic mode
+    bool m_micPairing = false;   // status push: the camera is in pairing mode
+    bool m_micScanning = false;  // status push: the camera is scanning for a mic
+    bool m_micPairBusy = false;  // OUR pair/clear command is in flight
+    int m_micPairRecord = -1;    // has_pair_record (0/1, -1 unknown)
+    int m_micButtonDevice = -1;  // device-reported DevTWSKeyType (-1 unknown)
+    bool m_capMicButton = false; // runtime probe: cameraGetTWSInfoR answered OK
 
     bool m_previewAvailable = false;
     // Managed ffplay preview process (NOT detached) so it is killed when the app
