@@ -133,6 +133,15 @@ class CameraController : public QObject {
     // ObsbotTwsCompat.h), so a camera/firmware that ignores it must show the
     // mic extras as unavailable rather than pretend.
     Q_PROPERTY(bool capMicButton READ capMicButton NOTIFY micChanged)
+    // Second, INDEPENDENT mic gate: true when this build can reach the per-mic
+    // mute/gain entry points (Device::cameraTXSet/GetAudio{Mute,Gain}R) AND the
+    // camera answers cameraGetTWSInfoR. Without it the mic cards still SHOW mute
+    // and gain — cameraGetTWSInfoR reports both — they just cannot be changed.
+    Q_PROPERTY(bool capMicGain READ capMicGain NOTIFY micChanged)
+    // Per-mic NOISE REDUCTION is report-only, everywhere and always: libdev
+    // exports no per-mic setter. Exposed so the page can say so in one place
+    // instead of hard-coding the claim in QML.
+    Q_PROPERTY(bool capMicNoiseReduce READ capMicNoiseReduce CONSTANT)
 
     // ----- the camera's own microphone (the Tiny 3's mic array) -----
     // Every value is -1 while unknown — including when the camera does not
@@ -163,6 +172,24 @@ class CameraController : public QObject {
     // bound camera answers Device::cameraGetAudioVolumeR (exported by libdev,
     // absent from the public header — see ObsbotTwsCompat.h).
     Q_PROPERTY(bool capAudio READ capAudio NOTIFY audioChanged)
+
+    // ----- device event push (Device::setDevEventNotifyCallbackFunc) -----
+    // UNPROVEN ON THIS HARDWARE. dev.hpp documents that callback "@category tail
+    // air"; whether a Tiny 3 ever fires it is exactly what devEventsSeen exists
+    // to answer. Everything below is therefore additive: it appears when an event
+    // arrives and is simply absent otherwise. No control is gated on it, nothing
+    // waits for it, and no timeout treats its silence as a failure.
+    //
+    // deviceFault latches on kEvtErrAiComm: the camera's AI subsystem has failed,
+    // which matters because the Tiny 3 then accepts tracking commands and
+    // silently ignores them while cameraStatus() still reports everything normal
+    // — the app's Track toggle looks fine and does nothing.
+    Q_PROPERTY(bool deviceFault MEMBER m_deviceFault NOTIFY faultChanged)
+    Q_PROPERTY(QString deviceFaultReason MEMBER m_deviceFaultReason NOTIFY faultChanged)
+    // Has this camera EVER pushed a device event? Purely diagnostic honesty: it
+    // lets the UI say "no device events have arrived from this camera" instead of
+    // showing an empty cue area that implies the feature is working.
+    Q_PROPERTY(bool devEventsSeen MEMBER m_devEventsSeen NOTIFY faultChanged)
 
 public:
     enum ConnState { Disconnected = 0, Discovering = 1, Connected = 2 };
@@ -223,6 +250,8 @@ public:
     }
     QString micButtonActionName() const;
     bool capMicButton() const { return m_capMicButton; }
+    bool capMicGain() const { return m_capMicGain && m_capMicButton; }
+    bool capMicNoiseReduce() const { return false; }   // no exported per-mic NR setter
 
     // Same optimistic-while-in-flight idiom as micButtonAction: source and mode
     // are only confirmed by the next status push (2–3 s, or the next duty window
@@ -289,6 +318,16 @@ public slots:
     // capability the hardware does not have.
     void micPair();
     void micClearPairing(int tx);    // forget the mic linked to a slot
+    // Per-mic mute and gain. Distinct from setAudioMute/setAudioVolume, which act
+    // on whichever SOURCE the camera is listening to: these are the Vox SE's own
+    // settings, the same ones its button changes.
+    //
+    // GAIN IS RELATIVE, on purpose. The SDK documents no range for it, so the UI
+    // steps the value the CAMERA reported rather than driving a 0–100 slider that
+    // would assert a scale nobody has verified. micGainStep is the step size in
+    // the device's own units.
+    void setMicMute(int tx, bool muted);
+    void nudgeMicGain(int tx, int delta);
     // Assign the multi-function button. Persists always, and pushes to the
     // device when the runtime probe says it will listen.
     void setMicButtonAction(int idx);
@@ -323,6 +362,7 @@ signals:
     void discoveryFinished(bool found);   // one-shot, used by --self-test
     void micChanged();
     void audioChanged();   // the camera's own microphone (kept apart from micChanged)
+    void faultChanged();   // device event push: AI fault latch / "any event seen yet"
 
 private slots:
     void onConnectionResolved(bool found, const QString &product, const QString &sn,
@@ -339,8 +379,13 @@ private slots:
     void onTwsInfo(bool supported, int keyCmd,
                    int batt1, bool charging1, bool muted1,
                    int batt2, bool charging2, bool muted2);
+    void onTwsMicAudio(bool ctlSupported, int gain1, int ns1, int nsLevel1,
+                       int gain2, int ns2, int nsLevel2);
     void onMicAudioSelect(int hasPairRecord, int isAuto, int supportAuto);
     void onAudioState(bool supported, int volume, int muted, int noiseReduce, int noiseLevel, int agc);
+    void onDeviceEvent(int eventType, const QString &name);
+    void onDeviceFault(bool faulted, const QString &reason);
+    void onMicTip(int slot, const QString &what);
 
 private:
     double speedValue() const;   // speedMode -> gimbal reference speed
@@ -416,7 +461,31 @@ private:
     // NOTE: transmitter name and firmware are deliberately absent — the public
     // SDK has no source for them (the old cameraTXGet* getters this feature was
     // first written against do not exist in the official header).
-    struct MicTx { bool online = false; int battery = -1; bool charging = false; bool muted = false; } m_micTx[2];
+    // gain is SIGNED and in the device's own undocumented units, so it needs a
+    // separate gainKnown flag — unlike battery, -1 is a perfectly legal gain and
+    // cannot double as "unknown". ns/nsLevel are report-only (no exported per-mic
+    // setter). tip is the last device-event cue for this slot, blanked again by
+    // m_micTipTimer; it stays empty forever on a camera that never pushes events.
+    struct MicTx {
+        bool online = false;
+        int battery = -1;
+        bool charging = false;
+        bool muted = false;
+        int gain = 0;
+        bool gainKnown = false;
+        // Optimistic gain while a step is in flight. Without it, two quick
+        // presses both compute from the same device-reported value and the
+        // second sends an identical command — the "every other press does
+        // nothing" the user hit. Cleared when the camera confirms, or by
+        // m_micGainTimer.
+        int gainTarget = 0;
+        bool gainPending = false;
+        int ns = -1;
+        int nsLevel = -1;
+        QString tip;      // last button press seen for this mic — kept, not cleared
+        QString tipAt;    // when it happened
+        bool tipRecent = false;   // drives the highlight only
+    } m_micTx[2];
     bool m_micTwsMode = false;   // status push: BT TWS mode instead of 2.4G mic mode
     bool m_micPairing = false;   // status push: the camera is in pairing mode
     bool m_micScanning = false;  // status push: the camera is scanning for a mic
@@ -430,7 +499,17 @@ private:
     // never leave the selector lying indefinitely.
     int m_micButtonTarget = -1;
     QTimer *m_micButtonTimer = nullptr;
+    QTimer *m_micGainTimer = nullptr;   // gives up on an unconfirmed gain step
     bool m_capMicButton = false; // runtime probe: cameraGetTWSInfoR answered OK
+    bool m_capMicGain = false;   // build probe: the per-mic set/get symbols resolved
+    QTimer *m_micTipTimer = nullptr;   // blanks the transient per-mic event cues
+
+    // Device event push. m_deviceFault only ever becomes true because the camera
+    // SAID so (kEvtErrAiComm) — it is never inferred from a command that failed
+    // to take effect, which would be a guess dressed up as a diagnosis.
+    bool m_deviceFault = false;
+    QString m_deviceFaultReason;
+    bool m_devEventsSeen = false;
 
     // The camera's own microphone. -1 everywhere means "unknown" — the value the
     // UI renders as "—" rather than guessing.

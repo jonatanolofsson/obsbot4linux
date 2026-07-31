@@ -31,6 +31,37 @@ RowLayout {
         Layout.alignment: Qt.AlignTop
         spacing: Theme.s3
 
+        // AI FAULT. Only ever shown because the CAMERA said so: it is raised by
+        // the device event push (kEvtErrAiComm) and never inferred from a command
+        // that seemed not to take, which would be a guess dressed as a diagnosis.
+        //
+        // It matters because in this state the Tiny 3 keeps answering
+        // cameraStatus() as if all were well while silently ignoring every
+        // tracking command — the toggle below looks healthy and does nothing.
+        //
+        // CAVEAT, and the reason nothing is disabled on the strength of it: the
+        // SDK documents that event push for the Tail Air, so a Tiny 3 may never
+        // send it. Absence of this banner is NOT evidence that the camera is fine.
+        Rectangle {
+            visible: cam.deviceFault
+            Layout.fillWidth: true
+            radius: Theme.rControl
+            color: Qt.rgba(Theme.offline.r, Theme.offline.g, Theme.offline.b, 0.12)
+            border.width: 1
+            border.color: Qt.rgba(Theme.offline.r, Theme.offline.g, Theme.offline.b, 0.5)
+            implicitHeight: faultBanner.implicitHeight + 20
+            Text {
+                id: faultBanner
+                anchors.fill: parent; anchors.margins: 10
+                text: "Camera fault: " + cam.deviceFaultReason
+                    + ". The controls below will be accepted and ignored until the camera is "
+                    + "unplugged and plugged back in."
+                color: Theme.offline
+                font.family: Theme.mono; font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+        }
+
         GlassPanel {
             Layout.fillWidth: true
             implicitHeight: aiCol.implicitHeight + 28

@@ -81,6 +81,18 @@ public slots:
     // wireless_mic.tx_state going non-zero in the status push (micStatus).
     void cmdTxPair(int tx, bool enable);
     void cmdTxClear(int tx);
+    // PER-MIC mute and gain (Device::cameraTXSetAudioMuteR / cameraTXSetAudioGainR
+    // — exported, undeclared, see ObsbotTwsCompat.h). tx is 1-based = DevTXType.
+    // Both re-read the device straight afterwards rather than trusting rc.
+    //
+    // GAIN IS IN THE DEVICE'S OWN UNITS. The SDK documents no range for it, so
+    // nothing here rescales: the caller passes an absolute value derived from
+    // what the camera last REPORTED (DevTWSInfo::micN_gain), clamped only to the
+    // int8 that field can hold. cmdSetTxGain logs the value the device answers
+    // with when it differs from the request — that readback is the only way this
+    // app will ever learn the real bounds.
+    void cmdSetTxMute(int tx, bool muted);
+    void cmdSetTxGain(int tx, int gain);
     // Audio-source auto-select attributes (Device::cameraGetAudioSelectR),
     // emitted as micAudioSelect. Two jobs: has_pair_record == 0 is the "no mic
     // has ever been paired to this camera" diagnostic, and is_auto is the
@@ -180,6 +192,35 @@ signals:
     void twsInfo(bool supported, int keyCmd,
                  int batt1, bool charging1, bool muted1,
                  int batt2, bool charging2, bool muted2);
+    // Per-mic AUDIO detail, read from the SAME DevTWSInfo struct as twsInfo but
+    // emitted separately because it is gated on a DIFFERENT capability:
+    // cameraGetTWSInfoR REPORTS gain/noise-reduction, while CHANGING gain needs
+    // the cameraTXSet/GetAudio*R family, which is an independent set of exports
+    // (ctlSupported == ObsbotTws::txAudioLinked()). gainN is in the device's own
+    // undocumented units; nsN is 0/1; nsLevelN is the device's raw level byte.
+    // Every field is meaningless unless twsInfo's `supported` was true.
+    //
+    // NOISE REDUCTION IS REPORT-ONLY: libdev exports no per-mic NR setter (see
+    // ObsbotTwsCompat.h), so the UI shows nsN/nsLevelN and offers no control.
+    void twsMicAudio(bool ctlSupported,
+                     int gain1, int ns1, int nsLevel1,
+                     int gain2, int ns2, int nsLevel2);
+    // Device event push (Device::setDevEventNotifyCallbackFunc — public, and the
+    // ONE thing here the SDK header actually declares). eventType is the SDK's
+    // RmEventType value verbatim; name is our decode, or empty when the value is
+    // outside the enum we know. UNPROVEN ON THIS HARDWARE: the header documents
+    // this callback "@category tail air", so a Tiny 3 may never fire it — every
+    // consumer must degrade silently rather than assume the events arrive.
+    void deviceEvent(int eventType, const QString &name);
+    // AI-subsystem fault latch, from kEvtErrAiComm (set) / kEvtInfoAiComm
+    // (clear). Matters because in this state the camera keeps answering
+    // cameraStatus() normally and silently ignores tracking commands — the Track
+    // toggle looks fine and does nothing. Only ever emitted if the callback above
+    // actually fires.
+    void deviceFault(bool faulted, const QString &reason);
+    // A wireless-mic button/status tip (the kEvtTipsTWS* range). slot is 1 or 2
+    // where the event names one, else 0 ("this happened, but not which mic").
+    void micTip(int slot, const QString &what);
     // Device::cameraGetAudioSelectR readback. Each field is -1 when the call is
     // unavailable, else 0/1. hasPairRecord == 0 means no mic has ever been
     // paired to this camera. isAuto is the source ARBITRATION flag — while it is
@@ -208,6 +249,16 @@ private:
     // the actual pair/unpair once the camera is known to be awake.
     bool wakeForMic(const QString &action);
     void sendTxPair(int tx, bool enable);
+    // cmdReadTwsInfo's body, returning the key_cmd the camera reported (-1 if it
+    // could not be read) for the confirm poller below.
+    int readTwsInfo();
+    // Confirming a mic-button assignment takes POLLING, not a single read: the
+    // camera keeps answering the previous key_cmd for up to ~3 s after a write
+    // that has already succeeded. startKeyConfirm arms the poll; onKeyConfirmTick
+    // re-reads (emitting twsInfo each time, so the UI settles as soon as the
+    // device agrees) and stops on a match or when the budget expires.
+    void startKeyConfirm(int target);
+    void onKeyConfirmTick();
     // Gesture-friendly mode: open a one-push status window NOW (closed again by
     // onSdkStatus). Called after state-changing commands (wake/sleep/AI/preset)
     // so their effects reach the UI immediately instead of at the next duty
@@ -222,6 +273,18 @@ private:
     // bits0-2 source (DevAudioSourceType), bits3-7 mode (AudioModeType).
     void onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr, int hdrSupport, int fps, int sleepMicro, int autoSleepSec, int micBits, int audioBits);
     void onDevChanged(const QString &sn, bool plugged);
+    // Device event, already marshalled onto the worker thread. `result` from the
+    // SDK is deliberately NOT forwarded: its type is event-specific and
+    // undocumented for every event this app cares about, and it points into the
+    // SDK thread's buffer, so reading it later would be a guess AND a lifetime
+    // bug. The numeric event_type is the whole payload.
+    void onDevEvent(int eventType);
+    // Install (or, with `on == false`, replace with a no-op) the device event
+    // callback. Never installs an EMPTY std::function: libdev is closed source
+    // and may call it unchecked, which on an empty std::function is
+    // std::bad_function_call — i.e. a crash on shutdown. A no-op lambda is the
+    // safe way to let go of `this`.
+    void setDevEventCallback(bool on);
 
     static void sdkStatusTrampoline(void *param, const void *data);
 
@@ -233,6 +296,10 @@ private:
     // lazy; ticks are silent and are skipped while shutting down or in quiet
     // mode so it never re-adds the USB traffic the gesture work removed.
     QTimer *m_twsInfoTimer = nullptr;
+    // Short-lived poll that runs only while a mic-button assignment is settling.
+    QTimer *m_keyConfirmTimer = nullptr;
+    int m_keyConfirmTarget = -1;
+    int m_keyConfirmTicksLeft = 0;
     // Runtime capability: the connected camera answered cameraGetTWSInfoR.
     // m_twsProbed makes the FIRST verdict always log, including a negative one.
     bool m_twsSupported = false;
@@ -242,6 +309,10 @@ private:
     // mic array and no wireless-mic support, or the reverse.
     bool m_audioSupported = false;
     bool m_audioProbed = false;
+    // The device event callback is installed on this device (so shutdown/unplug
+    // knows to hand it back). NOT a capability flag: registering it says nothing
+    // about whether a Tiny 3 ever fires an event.
+    bool m_devEventRegistered = false;
     int m_pollElapsedMs = 0;
     int m_pollTimeoutMs = 6000;
     bool m_devChangedRegistered = false;

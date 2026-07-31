@@ -94,6 +94,31 @@ RowLayout {
             }
         }
 
+        // AI FAULT — raised only by the camera's own device-event push
+        // (kEvtErrAiComm), never inferred. In that state the Tiny 3 keeps
+        // reporting normal status and silently ignores tracking commands, so the
+        // AI Track chip below would look healthy while doing nothing. The SDK
+        // documents that push for the Tail Air, so its ABSENCE proves nothing —
+        // which is why no control is disabled on the strength of it. Details and
+        // the same banner live on the AI Tracking page.
+        Rectangle {
+            visible: cam.deviceFault
+            Layout.fillWidth: true
+            radius: Theme.rControl
+            color: Qt.rgba(Theme.offline.r, Theme.offline.g, Theme.offline.b, 0.12)
+            border.width: 1
+            border.color: Qt.rgba(Theme.offline.r, Theme.offline.g, Theme.offline.b, 0.5)
+            implicitHeight: ctrlFault.implicitHeight + 20
+            Text {
+                id: ctrlFault
+                anchors.fill: parent; anchors.margins: 10
+                text: "Camera fault: " + cam.deviceFaultReason
+                color: Theme.offline
+                font.family: Theme.mono; font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+        }
+
         GlassPanel {
             Layout.fillWidth: true
             Layout.fillHeight: true

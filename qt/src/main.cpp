@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "AudioMeter.h"
 #include "CameraController.h"
 #include "PreviewEngine.h"
 
@@ -110,9 +111,18 @@ int main(int argc, char **argv) {
                          preview.setResIndex(controller.previewResIndex());
                      });
 
+    // Input-level meter for the camera's USB audio input (GUI mode only, like the
+    // preview). Nothing to do with the SDK — pure Qt Multimedia — and it only
+    // holds the audio device while the Mic page is on screen (the page drives
+    // audioMeter.setActive from its own visibility).
+    AudioMeter audioMeter;
+    QObject::connect(&audioMeter, &AudioMeter::logLine,
+                     &controller, &CameraController::logLine);
+
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("cam", &controller);
     engine.rootContext()->setContextProperty("preview", &preview);
+    engine.rootContext()->setContextProperty("audioMeter", &audioMeter);
     engine.loadFromModule("Obsbot", "Main");
     if (engine.rootObjects().isEmpty()) {
         std::fprintf(stderr, "Failed to load QML UI (no display, or missing Qt Quick runtime).\n");

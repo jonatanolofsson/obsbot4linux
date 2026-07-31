@@ -27,6 +27,14 @@
 //       _ZN6Device19setBlePairingEnableEbh
 //   Device::setBlePairingExit()
 //       _ZN6Device17setBlePairingExitEv
+//   Device::cameraTXSetAudioMuteR(Device::DevTXType, bool)
+//       _ZN6Device21cameraTXSetAudioMuteRENS_9DevTXTypeEb
+//   Device::cameraTXGetAudioMuteR(Device::DevTXType, bool&)
+//       _ZN6Device21cameraTXGetAudioMuteRENS_9DevTXTypeERb
+//   Device::cameraTXSetAudioGainR(Device::DevTXType, int)
+//       _ZN6Device21cameraTXSetAudioGainRENS_9DevTXTypeEi
+//   Device::cameraTXGetAudioGainR(Device::DevTXType, int&)
+//       _ZN6Device21cameraTXGetAudioGainRENS_9DevTXTypeERi
 //
 // …and, for the camera's OWN microphone (the Tiny 3's mic array), a second
 // family in exactly the same situation — exported, undeclared:
@@ -147,6 +155,32 @@ int32_t obsbot_cameraTXSetPairEnabled(Device *self, Device::DevTXType tx, bool e
 /// Device::cameraTXClearPairedInfo — forget the mic linked to a slot.
 int32_t obsbot_cameraTXClearPairedInfo(Device *self, Device::DevTXType tx)
     __asm__("_ZN6Device23cameraTXClearPairedInfoENS_9DevTXTypeE") __attribute__((weak));
+
+/// PER-MIC mute and gain. cameraGetTWSInfoR already REPORTS both (DevTWSInfo's
+/// mic_info.micN_mute and micN_gain), so these four are the WRITE side plus a
+/// per-slot second opinion on the readback. tx is ONE-based (DevTX1 = 1).
+///
+/// GAIN RANGE IS UNDOCUMENTED. The setter takes a plain int and the SDK header
+/// documents no bounds for it; the only hard fact is that DevTWSInfo stores the
+/// value the device reports back in an `int8_t`, so anything outside [-128,127]
+/// cannot round-trip. That int8 is the ONLY defensible clamp — callers must not
+/// invent a 0-100 scale, and the UI must adjust the value the DEVICE reports
+/// rather than assert a range of its own. See CameraWorker::cmdSetTxGain, which
+/// reads the value straight back with cameraTXGetAudioGainR and logs it when the
+/// camera lands somewhere other than where it was asked to.
+///
+/// There is deliberately no per-mic NOISE-REDUCTION setter here: libdev exports
+/// none. (cameraSetTWSFuncR(DevTWSFuncType, bool, short) can switch the TWS
+/// denoise FUNCTION, but it takes no DevTXType — it is not per-mic — so the
+/// per-mic ns/ns_level fields of DevTWSInfo are read-only for this app.)
+int32_t obsbot_cameraTXSetAudioMuteR(Device *self, Device::DevTXType tx, bool muted)
+    __asm__("_ZN6Device21cameraTXSetAudioMuteRENS_9DevTXTypeEb") __attribute__((weak));
+int32_t obsbot_cameraTXGetAudioMuteR(Device *self, Device::DevTXType tx, bool *muted)
+    __asm__("_ZN6Device21cameraTXGetAudioMuteRENS_9DevTXTypeERb") __attribute__((weak));
+int32_t obsbot_cameraTXSetAudioGainR(Device *self, Device::DevTXType tx, int gain)
+    __asm__("_ZN6Device21cameraTXSetAudioGainRENS_9DevTXTypeEi") __attribute__((weak));
+int32_t obsbot_cameraTXGetAudioGainR(Device *self, Device::DevTXType tx, int *gain)
+    __asm__("_ZN6Device21cameraTXGetAudioGainRENS_9DevTXTypeERi") __attribute__((weak));
 
 /// Device::setBlePairingEnable / setBlePairingExit — the camera's generic BLE
 /// pairing window. Belt-and-braces around the TX pairing call: both return rc=0
@@ -295,6 +329,73 @@ inline int32_t clearPairedInfo(Device *dev, Device::DevTXType tx) {
 #else
     (void)dev;
     (void)tx;
+    return RM_RET_ERR;
+#endif
+}
+
+/// True when the PER-MIC mute/gain entry points resolved. A third, independent
+/// gate: libdev could perfectly well ship cameraGetTWSInfoR (which REPORTS mute
+/// and gain) without the cameraTXSet*/Get* family that CHANGES them, and then
+/// the mic cards must show those two as read-only rather than offer a control
+/// that cannot fire. Says nothing about whether the camera answers — the set's
+/// rc and the readback right after it are the honest verdict for that.
+inline bool txAudioLinked() {
+#if OBSBOT_TWS_COMPAT
+    return obsbot_cameraTXSetAudioMuteR != nullptr && obsbot_cameraTXSetAudioGainR != nullptr
+           && obsbot_cameraTXGetAudioGainR != nullptr && obsbot_cameraTXGetAudioMuteR != nullptr;
+#else
+    return false;
+#endif
+}
+
+/// tx is ONE-based: Device::DevTX1 / Device::DevTX2.
+inline int32_t setTxMute(Device *dev, Device::DevTXType tx, bool muted) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraTXSetAudioMuteR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraTXSetAudioMuteR(dev, tx, muted);
+#else
+    (void)dev;
+    (void)tx;
+    (void)muted;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t getTxMute(Device *dev, Device::DevTXType tx, bool &muted) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraTXGetAudioMuteR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraTXGetAudioMuteR(dev, tx, &muted);
+#else
+    (void)dev;
+    (void)tx;
+    (void)muted;
+    return RM_RET_ERR;
+#endif
+}
+
+/// gain is in the device's OWN, undocumented units — see the declaration above.
+/// Nothing here rescales it; the caller passes through what the device reported
+/// (± a step), and the int8 clamp is the only bound anyone can defend.
+inline int32_t setTxGain(Device *dev, Device::DevTXType tx, int gain) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraTXSetAudioGainR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraTXSetAudioGainR(dev, tx, gain);
+#else
+    (void)dev;
+    (void)tx;
+    (void)gain;
+    return RM_RET_ERR;
+#endif
+}
+
+inline int32_t getTxGain(Device *dev, Device::DevTXType tx, int &gain) {
+#if OBSBOT_TWS_COMPAT
+    if (!dev || obsbot_cameraTXGetAudioGainR == nullptr) return RM_RET_ERR;
+    return obsbot_cameraTXGetAudioGainR(dev, tx, &gain);
+#else
+    (void)dev;
+    (void)tx;
+    (void)gain;
     return RM_RET_ERR;
 #endif
 }

@@ -44,6 +44,15 @@ constexpr int kAudioConfirmMs = 6000;
 // Default noise-reduction strength used when the user turns NR on before the
 // camera has ever reported a level (documented range [1-10]; 5 = middle).
 constexpr int kAudioNoiseLevelDefault = 5;
+// Per-mic gain step, in the DEVICE's own units. The SDK documents no range for
+// wireless-mic gain, so the UI adjusts the value the camera reported by this much
+// per click rather than pretending to know a 0–100 scale. 1 is the smallest step
+// the int8 the device reports back can express — deliberately conservative, since
+// a wrong guess about the unit size is a wrong guess about how loud the mic gets.
+constexpr int kMicGainStep = 1;
+// How long a device-event cue ("mute button", "track on") stays on a mic card.
+// Long enough to notice, short enough that a stale cue never reads as state.
+constexpr int kMicTipMs = 4000;
 } // namespace
 
 CameraController::CameraController(QObject *parent) : QObject(parent) {
@@ -66,13 +75,35 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     // Same safety net for the mic-button selector: if the camera never confirms
     // the new assignment, stop showing the optimistic value and fall back to
     // whatever the device actually reports.
+    //
+    // This MUST outlast the worker's confirm poll (kKeyConfirmBudgetMs, 6 s) or
+    // the UI declares failure while the answer is still on its way. It used to
+    // be 4 s against a camera measured taking up to ~3 s to report a write it
+    // had already applied — close enough that the give-up fired first and the
+    // selector sprang back on a change that had in fact succeeded.
     m_micButtonTimer = new QTimer(this);
     m_micButtonTimer->setSingleShot(true);
-    m_micButtonTimer->setInterval(4000);
+    m_micButtonTimer->setInterval(7000);
     connect(m_micButtonTimer, &QTimer::timeout, this, [this]() {
         if (m_micButtonTarget >= 0) {
             emit logLine("warn", QStringLiteral("mic button: camera did not confirm the new assignment"));
             m_micButtonTarget = -1;
+            emit micChanged();
+        }
+    });
+
+    // Give-up net for an in-flight gain step: if the camera never reports the
+    // value we asked for, stop showing it and fall back to what it does report.
+    m_micGainTimer = new QTimer(this);
+    m_micGainTimer->setSingleShot(true);
+    m_micGainTimer->setInterval(4000);
+    connect(m_micGainTimer, &QTimer::timeout, this, [this]() {
+        bool any = false;
+        for (MicTx &t : m_micTx)
+            if (t.gainPending) { t.gainPending = false; any = true; }
+        if (any) {
+            emit logLine("warn", QStringLiteral("mic gain: the camera did not confirm the new value — "
+                                                "showing what it reports again"));
             emit micChanged();
         }
     });
@@ -103,6 +134,22 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
         }
     });
 
+    // Blanks the transient per-mic event cues. One shared timer, not one per
+    // slot: the cues are momentary and a second press simply restarts the window.
+    m_micTipTimer = new QTimer(this);
+    m_micTipTimer->setSingleShot(true);
+    m_micTipTimer->setInterval(kMicTipMs);
+    connect(m_micTipTimer, &QTimer::timeout, this, [this]() {
+        // Only the highlight expires. Clearing the text made the row claim "no
+        // press seen yet" moments after reporting one, which is simply false —
+        // and it threw away the single most useful thing the row can say.
+        bool dirty = false;
+        for (MicTx &t : m_micTx) {
+            if (t.tipRecent) { t.tipRecent = false; dirty = true; }
+        }
+        if (dirty) emit micChanged();
+    });
+
     m_worker = new CameraWorker;   // no parent: it will live on m_thread
     m_worker->moveToThread(&m_thread);
     connect(&m_thread, &QThread::started, m_worker, &CameraWorker::init);
@@ -120,8 +167,12 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     connect(m_worker, &CameraWorker::presetCaptured, this, &CameraController::onPresetCaptured);
     connect(m_worker, &CameraWorker::micStatus, this, &CameraController::onMicStatus);
     connect(m_worker, &CameraWorker::twsInfo, this, &CameraController::onTwsInfo);
+    connect(m_worker, &CameraWorker::twsMicAudio, this, &CameraController::onTwsMicAudio);
     connect(m_worker, &CameraWorker::micAudioSelect, this, &CameraController::onMicAudioSelect);
     connect(m_worker, &CameraWorker::audioState, this, &CameraController::onAudioState);
+    connect(m_worker, &CameraWorker::deviceEvent, this, &CameraController::onDeviceEvent);
+    connect(m_worker, &CameraWorker::deviceFault, this, &CameraController::onDeviceFault);
+    connect(m_worker, &CameraWorker::micTip, this, &CameraController::onMicTip);
 
     m_thread.start();
 }
@@ -231,6 +282,20 @@ QVariantList CameraController::micTxList() const {
         m["battery"] = t.battery;
         m["charging"] = t.charging;
         m["muted"] = t.muted;
+        // Gain is signed and in the device's own undocumented units, so it needs
+        // its own known-flag: -1 is a legal gain, not "unknown".
+        m["gain"] = t.gainPending ? t.gainTarget : t.gain;
+        m["gainKnown"] = t.gainKnown || t.gainPending;
+        // Report-only (no exported per-mic setter): 0/1 and the device's raw
+        // level byte, -1 when the camera has not said.
+        m["ns"] = t.ns;
+        m["nsLevel"] = t.nsLevel;
+        // Last device-event cue for this slot; empty on a camera that never
+        // pushes events, which is the expected case on a Tiny 3.
+        m["tip"] = t.tip;
+        m["tipAt"] = t.tipAt;
+        m["tipRecent"] = t.tipRecent;
+
         out.append(m);
     }
     return out;
@@ -794,6 +859,61 @@ void CameraController::micClearPairing(int tx) {
     QMetaObject::invokeMethod(m_worker, "cmdTxClear", Qt::QueuedConnection, Q_ARG(int, tx));
 }
 
+// Per-mic mute. No optimistic value: the worker re-reads the device on the same
+// round trip (cameraTXGetAudioMuteR plus a fresh DevTWSInfo), so the readback
+// lands well inside the time a user could notice — unlike the source/pattern
+// pickers, whose only readback is the 2–3 s status push.
+void CameraController::setMicMute(int tx, bool muted) {
+    if (tx != 1 && tx != 2) return;
+    if (!connected() || !capMicGain()) {
+        emit logLine("warn", QStringLiteral("mic mute tx%1: the camera does not expose the per-mic "
+                                            "mic API — mute is shown, but cannot be changed here").arg(tx));
+        return;
+    }
+    QMetaObject::invokeMethod(m_worker, "cmdSetTxMute", Qt::QueuedConnection,
+                              Q_ARG(int, tx), Q_ARG(bool, muted));
+}
+
+// Per-mic gain, RELATIVE to what the camera reported.
+//
+// This is deliberately a stepper and not a slider. The SDK documents no range for
+// wireless-mic gain — the only hard fact is that DevTWSInfo carries it back in an
+// int8_t — so a 0–100 slider would be inventing a scale, and worse, would jump
+// the mic to an arbitrary level the moment it was touched. Stepping the device's
+// own value keeps every number on screen one the camera actually said.
+//
+// Refusing to step before the camera has reported a gain is the same honesty: we
+// would otherwise have to guess a starting point.
+void CameraController::nudgeMicGain(int tx, int delta) {
+    if ((tx != 1 && tx != 2) || delta == 0) return;
+    if (!connected() || !capMicGain()) {
+        emit logLine("warn", QStringLiteral("mic gain tx%1: the camera does not expose the per-mic "
+                                            "mic API — gain is shown, but cannot be changed here").arg(tx));
+        return;
+    }
+    const MicTx &t = m_micTx[tx - 1];
+    if (!t.online) {
+        emit logLine("warn", QStringLiteral("mic gain tx%1: no mic connected to that slot").arg(tx));
+        return;
+    }
+    if (!t.gainKnown) {
+        emit logLine("warn", QStringLiteral("mic gain tx%1: the camera has not reported a gain yet — "
+                                            "nothing to step from").arg(tx));
+        return;
+    }
+    // Step from the value the user can SEE (the pending one if a step is still
+    // in flight), so held or rapid presses accumulate instead of each recomputing
+    // from the last value the camera happened to report.
+    MicTx &slot = m_micTx[tx - 1];
+    const int base = slot.gainPending ? slot.gainTarget : slot.gain;
+    slot.gainTarget = base + delta * kMicGainStep;
+    slot.gainPending = true;
+    m_micGainTimer->start();
+    emit micChanged();
+    QMetaObject::invokeMethod(m_worker, "cmdSetTxGain", Qt::QueuedConnection,
+                              Q_ARG(int, tx), Q_ARG(int, slot.gainTarget));
+}
+
 // Busy cue for an in-flight pair/clear.
 //
 // For PAIRING the wait is genuinely long: the camera accepts the request in
@@ -894,7 +1014,17 @@ void CameraController::onDeviceLost(const QString &reason) {
     m_micButtonDevice = -1;
     m_micButtonTarget = -1;   // a reconnect must not resurrect a stale optimistic pick
     if (m_micButtonTimer) m_micButtonTimer->stop();
+    if (m_micTipTimer) m_micTipTimer->stop();
     m_capMicButton = false;   // re-probed on the next bind, never assumed
+    m_capMicGain = false;
+    // The AI-fault latch is a property of the DEVICE, so losing the device makes
+    // it unknown again — and "unknown" here means "not faulted", because keeping
+    // a red banner up for a camera that is no longer attached would be a claim we
+    // cannot support. devEventsSeen resets for the same reason: whether the NEXT
+    // camera pushes events is a fresh question.
+    m_deviceFault = false;
+    m_deviceFaultReason.clear();
+    m_devEventsSeen = false;
     // Built-in audio: with no device every value is unknown again (honesty), and
     // no optimistic pick may survive into the next connection.
     m_audioVolume = -1;
@@ -917,6 +1047,7 @@ void CameraController::onDeviceLost(const QString &reason) {
     emit zoomChanged();
     emit micChanged();
     emit audioChanged();
+    emit faultChanged();
     emit logLine("warn", QStringLiteral("device lost: %1 — controls disabled").arg(reason));
 }
 
@@ -966,7 +1097,9 @@ void CameraController::onStatusUpdate(int runState, int aiModeRaw, double zoom, 
             && m_aiEngageTime.isValid() && m_aiEngageTime.elapsed() < kAiDisengageHintMs) {
             emit logLine("warn", QStringLiteral(
                 "ai track: device disengaged itself right after enabling — it needs a "
-                "person in view to lock on. Aim the camera at yourself and try again."));
+                "person in view to lock on. Aim the camera at yourself and try again. "
+                "If it never engages AND the ring LED is solid red, the camera's AI "
+                "subsystem has faulted: unplug it and plug it back in."));
         }
         if (!m_aiTracking) m_aiEngageTime.invalidate();
     }
@@ -1137,9 +1270,19 @@ void CameraController::onMicStatus(bool tx1Online, bool tx2Online, bool twsMode,
     m_micTwsMode = twsMode;
     m_micPairing = pairing;
     m_micScanning = scanning;
-    // A slot that just went offline has no battery to report any more.
+    // A slot that just went offline has no battery, gain or mute state to report
+    // any more — and no pending button cue that could still be about it.
     for (MicTx &t : m_micTx) {
-        if (!t.online) { t.battery = -1; t.charging = false; t.muted = false; }
+        if (!t.online) {
+            t.battery = -1;
+            t.charging = false;
+            t.muted = false;
+            t.gainKnown = false;
+            t.gain = 0;
+            t.ns = -1;
+            t.nsLevel = -1;
+            t.tip.clear();
+        }
     }
     emit micChanged();
     if (cameOnline && m_capMicButton && connected())
@@ -1182,6 +1325,88 @@ void CameraController::onTwsInfo(bool supported, int keyCmd,
     m_micTx[1].battery = batteryOf(m_micTx[1].online, batt2);
     m_micTx[1].charging = m_micTx[1].online && charging2;
     m_micTx[1].muted = m_micTx[1].online && muted2;
+    emit micChanged();
+}
+
+// Per-mic gain and noise reduction, from the same DevTWSInfo read as onTwsInfo.
+// ctlSupported is a BUILD fact (did the per-mic set/get symbols resolve), not a
+// device one — the camera answering cameraGetTWSInfoR is what capMicGain also
+// requires, and the set's own rc is the final word.
+//
+// Like the battery bytes, these only mean something for a slot the camera says is
+// online: an empty slot's gain byte is whatever was last left there.
+void CameraController::onTwsMicAudio(bool ctlSupported, int gain1, int ns1, int nsLevel1,
+                                     int gain2, int ns2, int nsLevel2) {
+    m_capMicGain = ctlSupported;
+    const int gains[2] = {gain1, gain2};
+    const int nss[2] = {ns1, ns2};
+    const int levels[2] = {nsLevel1, nsLevel2};
+    for (int i = 0; i < 2; ++i) {
+        MicTx &t = m_micTx[i];
+        // kTxGainUnknown (the worker's out-of-int8 sentinel) means the TWS read
+        // itself failed — not a gain of any kind.
+        const bool known = t.online && gains[i] >= -128 && gains[i] <= 127;
+        t.gainKnown = known;
+        t.gain = known ? gains[i] : 0;
+        // The camera has caught up with the step we asked for, so the optimistic
+        // value has done its job. Also drop it if the slot went away.
+        // No bound is inferred from a mismatch here. "The camera reports a
+        // different value than we asked for" cannot be told apart from "the
+        // readback has not caught up yet", and treating the latter as a limit
+        // invented a floor that then blocked the step it was inferred from.
+        // The mic ignoring an out-of-range value is harmless; a wrong limit is
+        // not.
+        if (t.gainPending && (!t.online || (known && t.gain == t.gainTarget)))
+            t.gainPending = false;
+        t.ns = t.online ? nss[i] : -1;
+        t.nsLevel = t.online ? levels[i] : -1;
+    }
+    if (!m_micTx[0].gainPending && !m_micTx[1].gainPending)
+        m_micGainTimer->stop();
+    emit micChanged();
+}
+
+// ---------------------------------------------------------------------------
+// Device event push — everything here is CONDITIONAL on the camera actually
+// sending events, which on a Tiny 3 is unproven (dev.hpp: "@category tail air").
+// Silence is the expected case and is not treated as an error anywhere.
+// ---------------------------------------------------------------------------
+void CameraController::onDeviceEvent(int eventType, const QString &name) {
+    Q_UNUSED(eventType);
+    Q_UNUSED(name);
+    // The worker already logged the event with its numeric type — that log IS the
+    // experiment. All this adds is the one bit the UI can honestly state: that
+    // this camera pushes events at all.
+    if (!m_devEventsSeen) {
+        m_devEventsSeen = true;
+        emit faultChanged();
+    }
+}
+
+void CameraController::onDeviceFault(bool faulted, const QString &reason) {
+    if (faulted == m_deviceFault && reason == m_deviceFaultReason) return;
+    m_deviceFault = faulted;
+    m_deviceFaultReason = reason;
+    emit faultChanged();
+}
+
+// A wireless-mic button/status cue. slot 0 means the event did not say which mic,
+// in which case the cue goes on every ONLINE slot rather than being attributed to
+// a guess — showing "track on" under mic 1 when mic 2's button was pressed would
+// be a fabricated detail.
+void CameraController::onMicTip(int slot, const QString &what) {
+    bool dirty = false;
+    for (int i = 0; i < 2; ++i) {
+        const bool mine = (slot == i + 1) || (slot == 0 && m_micTx[i].online);
+        if (mine) {
+            m_micTx[i].tip = what;
+            m_micTx[i].tipAt = QTime::currentTime().toString(QStringLiteral("HH:mm:ss"));
+            m_micTx[i].tipRecent = true;   // highlight fades; the text stays
+            dirty = true;
+        }
+    }
+    if (!dirty) return;
+    m_micTipTimer->start();   // restart the window; a fresh press supersedes
     emit micChanged();
 }
 

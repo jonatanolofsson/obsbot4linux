@@ -33,6 +33,28 @@ constexpr int kTwsInfoPollMs = 60000;
 // finding), so pairing always runs awake — this gives the wake a moment to
 // take effect without blocking the worker's event loop.
 constexpr int kPairWakeSettleMs = 1200;
+// Confirming a mic-button assignment. HARDWARE FINDING: cameraSetTWSKeyTypeR
+// returns rc=0 immediately, but cameraGetTWSInfoR keeps answering the OLD
+// key_cmd for a while afterwards — measured at 316 ms and 2983 ms on two
+// consecutive writes to an AWAKE Tiny 3 (fw 6.6.8.25). The write itself never
+// failed. Reading back once, right after the set, therefore misses the change
+// almost every time: the UI gave up, sprang back to the previous segment, and
+// the user had to click twice — the second click "succeeding" only because it
+// read back what the FIRST click had already applied.
+//
+// So poll instead of asking once, and give it a budget comfortably past the
+// worst observed latency rather than the ~3 s that was nearly hit.
+constexpr int kKeyConfirmIntervalMs = 250;
+constexpr int kKeyConfirmBudgetMs   = 6000;
+// Per-mic gain bounds. NOT a documented range — the SDK gives none. This is the
+// only bound anyone can defend: DevTWSInfo carries the device's own reported gain
+// in an int8_t, so a value outside it could never be read back. The camera's real
+// limits are discovered empirically, by cmdSetTxGain's readback.
+constexpr int kTxGainMin = -128;
+constexpr int kTxGainMax = 127;
+// Out-of-int8 sentinel for "the camera has not reported a gain" — gain is signed,
+// so -1 is a legitimate value and cannot double as "unknown".
+constexpr int kTxGainUnknown = -1000;
 
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -72,6 +94,68 @@ const char *audioSourceName(int s) {
     case Device::DevAudioSourceTypeUsbC:      return "USB-C audio";
     default:                                  return "unknown source";
     }
+}
+
+// Device event decode. The values come from Device::RmEventType (dev.hpp) and are
+// referenced BY ENUMERATOR, never by a copied-out number, so a future SDK
+// renumbering cannot silently shift them. `micSlot` is 1/2 when the event names a
+// transmitter and 0 when it does not — several TWS tips genuinely do not say
+// which mic, and guessing would be worse than admitting it.
+//
+// Only the events this app acts on (plus the neighbours that make a log line
+// readable) are decoded; anything else logs as its raw number, which is the point
+// of the exercise — the SDK marks this whole callback "@category tail air", so
+// the numbers a Tiny 3 actually emits, if any, are what we are trying to find out.
+struct DevEventInfo {
+    const char *name;   // nullptr => unknown to us; log the raw number
+    int micSlot;        // 1/2 when the event names a transmitter, else 0
+};
+
+DevEventInfo devEventInfo(int t) {
+    switch (t) {
+    // Errors — kEvtErrAiComm is the one that changes app behaviour.
+    case Device::kEvtErrAiComm:        return {"AI communication error", 0};
+    case Device::kEvtErrGimbalComm:    return {"gimbal communication error", 0};
+    case Device::kEvtErrLensComm:      return {"lens communication error", 0};
+    case Device::kEvtErrSensor:        return {"sensor error", 0};
+    case Device::kEvtErrMedia:         return {"media error", 0};
+    case Device::kEvtErrBluetooth:     return {"bluetooth error", 0};
+    case Device::kEvtErrDevTempHigh:   return {"device temperature too high", 0};
+    // The "info" counterparts of the error events — the recovery edge.
+    case Device::kEvtInfoAiComm:       return {"AI communication restored", 0};
+    case Device::kEvtInfoGimbalComm:   return {"gimbal communication restored", 0};
+    case Device::kEvtInfoLensComm:     return {"lens communication restored", 0};
+    case Device::kEvtInfoBluetooth:    return {"bluetooth info", 0};
+    case Device::kEvtInfoDevTemp:      return {"device temperature normal", 0};
+    case Device::kEvtInfoTargetLoss:   return {"tracking target lost", 0};
+    case Device::kEvtWarnNoAudioInput: return {"no audio input", 0};
+    // Wireless-mic button / status tips.
+    case Device::kEvtTipsTWSFirstConnect:     return {"mic paired for the first time", 0};
+    case Device::kEvtTipsTWSTipConnect1:      return {"connected", 1};
+    case Device::kEvtTipsTWSTipConnect2:      return {"connected", 2};
+    case Device::kEvtTipsTWSTipElectric1:     return {"battery report", 1};
+    case Device::kEvtTipsTWSTipElectric2:     return {"battery report", 2};
+    case Device::kEvtTipsTWSTipMute1:         return {"mute button", 1};
+    case Device::kEvtTipsTWSTipMute2:         return {"mute button", 2};
+    case Device::kEvtTipsTWSTipMuteQuiet1:    return {"mute button (silent cue)", 1};
+    case Device::kEvtTipsTWSTipMuteQuiet2:    return {"mute button (silent cue)", 2};
+    case Device::kEvtTipsTWSTipDenoiseOn:     return {"noise reduction on", 0};
+    case Device::kEvtTipsTWSTipDenoiseOff:    return {"noise reduction off", 0};
+    case Device::kEvtTipsTWSTipRecordOn:      return {"record on", 0};
+    case Device::kEvtTipsTWSTipRecordOff:     return {"record off", 0};
+    case Device::kEvtTipsTWSTipHumanTrackOn:  return {"track on", 0};
+    case Device::kEvtTipsTWSTipHumanTrackOff: return {"track off", 0};
+    case Device::kEvtTipsTWSTipSingleTrack:   return {"single-person track", 0};
+    case Device::kEvtTipsTWSTipMultipleTrack: return {"multi-person track", 0};
+    default:                                  return {nullptr, 0};
+    }
+}
+
+// True for the kEvtTipsTWS* block — the events that describe a wireless mic.
+// Range-checked rather than re-listed so a tip we have no decode for still
+// refreshes the mic detail instead of being dropped.
+bool isTwsTip(int t) {
+    return t >= Device::kEvtTipsTWSFirstConnect && t <= Device::kEvtTipsTWSTipMultipleTrack;
 }
 
 const char *devModeName(Device::DevMode m) {
@@ -205,6 +289,12 @@ void CameraWorker::bindDevice(const std::shared_ptr<Device> &d) {
     // Subscribe to the periodic status push (~2–3 s) for run/AI/zoom state.
     d->setDevStatusCallbackFunc(&CameraWorker::sdkStatusTrampoline, this);
     d->enableDevStatusCallback(true);
+    // …and to the device EVENT push, right beside it. Unlike the status push this
+    // one is not periodic — the camera pushes when something happens (an AI fault,
+    // a mic button) — and, crucially, the SDK header marks it "@category tail
+    // air", so a Tiny 3 may never send a single event. Registering costs nothing
+    // and every consumer is written to degrade silently; see onDevEvent.
+    setDevEventCallback(true);
 
     emit logLine("ok", QStringLiteral("connected: %1  (SN %2, fw %3, %4)")
                            .arg(product, m_sn, fw, mode));
@@ -321,6 +411,95 @@ void CameraWorker::onSdkStatus(int runStatus, int aiMode, int faceFocus, int hdr
                    audioBits & 0x7, (audioBits >> 3) & 0x1f);
 }
 
+// ---------------------------------------------------------------------------
+// Device event push (Device::setDevEventNotifyCallbackFunc)
+//
+// The SDK calls this on ITS OWN thread, exactly like the status push and the
+// plug/unplug callback, so the lambda touches nothing but a queued invoke — the
+// same shape setDevChangedCallback already uses.
+//
+// OPEN QUESTION, and the reason nothing here is load-bearing: dev.hpp documents
+// the callback "@category tail air". Whether a Tiny 3 emits anything at all is
+// unknown until someone watches the log with hardware attached. So every event
+// is logged with its NUMERIC type (that log is the experiment), and the features
+// built on top — the AI-fault banner, the mic button cues — simply never appear
+// if the camera stays silent. Nothing waits on an event, nothing times out on
+// one, and no control is disabled because one failed to arrive.
+// ---------------------------------------------------------------------------
+void CameraWorker::setDevEventCallback(bool on) {
+    if (!m_dev) { m_devEventRegistered = false; return; }
+    if (on) {
+        m_dev->setDevEventNotifyCallbackFunc(
+            [this](void *, int32_t eventType, const void *) {
+                // SDK thread. Do NOT touch Qt or SDK state here, and do NOT read
+                // `result`: its type is event-specific, undocumented for every
+                // event this app uses, and it points into the SDK's own buffer.
+                const int t = static_cast<int>(eventType);
+                QMetaObject::invokeMethod(
+                    this, [this, t]() { onDevEvent(t); }, Qt::QueuedConnection);
+            },
+            this);
+        if (!m_devEventRegistered) {
+            m_devEventRegistered = true;
+            // Say plainly that this is a listening post, not a feature: it is the
+            // only way anyone reading the log can tell "no events happened" from
+            // "this camera does not send events".
+            emit logLine("sys", QStringLiteral(
+                "device events: listening (setDevEventNotifyCallbackFunc). The SDK documents "
+                "this push for the Tail Air only, so a Tiny 3 may never send one — every event "
+                "received is logged with its numeric type."));
+        }
+        return;
+    }
+    // Hand the callback back. Deliberately a NO-OP LAMBDA, never an empty
+    // std::function: libdev is closed source and may well invoke it without a
+    // null check, and invoking an empty std::function is std::bad_function_call
+    // — a crash during teardown, which is precisely what the deterministic
+    // shutdown design exists to prevent.
+    m_dev->setDevEventNotifyCallbackFunc([](void *, int32_t, const void *) {}, nullptr);
+    m_devEventRegistered = false;
+}
+
+void CameraWorker::onDevEvent(int eventType) {
+    if (m_shuttingDown) return;
+    const DevEventInfo info = devEventInfo(eventType);
+    const QString name = info.name ? QString::fromLatin1(info.name) : QString();
+    // Log EVERY event, decoded or not, with the raw number. On a Tiny 3 this line
+    // is the whole point: it is the only way to learn which events (if any) this
+    // camera actually pushes.
+    emit logLine("sys", name.isEmpty()
+                            ? QStringLiteral("device event: %1 (not in the SDK enum we decode)").arg(eventType)
+                            : QStringLiteral("device event: %1 (%2)").arg(eventType).arg(name));
+    emit deviceEvent(eventType, name);
+
+    // The AI subsystem. This is the event worth wiring: in an AI fault the Tiny 3
+    // shows a solid red ring and silently ignores tracking commands while
+    // cameraStatus() keeps reporting everything as normal — so the app's Track
+    // toggle looks healthy and does nothing.
+    if (eventType == Device::kEvtErrAiComm) {
+        emit logLine("warn", QStringLiteral(
+            "device fault: the camera reports an AI communication error. Tracking commands "
+            "will be accepted and silently ignored while this lasts (the ring LED goes solid "
+            "red). Unplug the camera and plug it back in to clear it."));
+        emit deviceFault(true, QStringLiteral("AI communication error — tracking is ignored until "
+                                              "the camera is power-cycled"));
+        return;
+    }
+    if (eventType == Device::kEvtInfoAiComm) {
+        emit logLine("ok", QStringLiteral("device fault cleared: AI communication restored"));
+        emit deviceFault(false, QString());
+        return;
+    }
+
+    // Wireless-mic tips. Two jobs: a transient cue on the mic card, and — more
+    // useful — a trigger to re-read DevTWSInfo, since a mute button press changes
+    // state the app would otherwise not see for up to 60 s.
+    if (isTwsTip(eventType)) {
+        emit micTip(info.micSlot, name.isEmpty() ? QStringLiteral("event %1").arg(eventType) : name);
+        if (m_twsSupported) cmdReadTwsInfo();
+    }
+}
+
 void CameraWorker::onDevChanged(const QString &sn, bool plugged) {
     if (m_shuttingDown) return;
     if (!plugged) {
@@ -328,6 +507,7 @@ void CameraWorker::onDevChanged(const QString &sn, bool plugged) {
         if (m_dev && (sn == m_sn || sn.isEmpty())) {
             emit logLine("warn", QStringLiteral("device unplugged (SN %1)").arg(m_sn));
             if (m_dev) m_dev->enableDevStatusCallback(false);
+            setDevEventCallback(false);   // let go of `this` before the handle drops
             m_dev.reset();
             m_aiTracking = false;
             m_twsSupported = false;
@@ -725,8 +905,14 @@ void CameraWorker::cmdPresetGo(int idx, double pitch, double yaw, double zoom, i
 // SILENT — no requireDevice, no logLine: this runs on bind and on a 60 s timer.
 // Doubles as the capability probe: rc == RM_RET_OK means this firmware answers
 // the undocumented TWS API, and only then are the extras advertised to the UI.
-void CameraWorker::cmdReadTwsInfo() {
-    if (!m_dev) return;
+void CameraWorker::cmdReadTwsInfo() { readTwsInfo(); }
+
+// The body of cmdReadTwsInfo, plus the one thing the confirm poller needs back:
+// the key_cmd the camera just reported (-1 when it could not be read). Kept as a
+// plain helper rather than giving the slot a return value, so the queued
+// invocations elsewhere stay ordinary void calls.
+int CameraWorker::readTwsInfo() {
+    if (!m_dev) return -1;
     Device::DevTWSInfo info{};
     const int rc = ObsbotTws::getInfo(m_dev.get(), info);
     const bool ok = (rc == RM_RET_OK);
@@ -740,11 +926,87 @@ void CameraWorker::cmdReadTwsInfo() {
     }
     if (!ok) {
         emit twsInfo(false, -1, -1, false, false, -1, false, false);
-        return;
+        emit twsMicAudio(false, kTxGainUnknown, -1, -1, kTxGainUnknown, -1, -1);
+        return -1;
     }
     emit twsInfo(true, static_cast<int>(info.key_cmd),
                  static_cast<int>(info.mic1_batt_level), info.mic1_chg_status != 0, info.mic_info.mic1_mute != 0,
                  static_cast<int>(info.mic2_batt_level), info.mic2_chg_status != 0, info.mic_info.mic2_mute != 0);
+    // Same struct, second signal — see the header for why these are kept apart.
+    // The gain and ns_level bytes are passed through EXACTLY as the device
+    // reported them (both are int8_t): no rescaling, no "helpful" clamp to a
+    // range nobody has verified.
+    emit twsMicAudio(ObsbotTws::txAudioLinked(),
+                     static_cast<int>(info.mic1_gain), info.mic_info.mic1_ns != 0 ? 1 : 0,
+                     static_cast<int>(info.mic1_ns_level),
+                     static_cast<int>(info.mic2_gain), info.mic_info.mic2_ns != 0 ? 1 : 0,
+                     static_cast<int>(info.mic2_ns_level));
+    return static_cast<int>(info.key_cmd);
+}
+
+// PER-MIC mute. Distinct from cmdSetAudioMute, which mutes whichever SOURCE the
+// camera is listening to: this is the Vox SE's own mute, the same state the mic's
+// button toggles, and it survives a source change.
+void CameraWorker::cmdSetTxMute(int tx, bool muted) {
+    const QString a = QStringLiteral("mic mute tx%1").arg(tx);
+    if (!requireDevice(a)) return;
+    if (tx != Device::DevTX1 && tx != Device::DevTX2) {
+        emit commandResult(a, false, -1, QStringLiteral("invalid transmitter slot"));
+        emit logLine("warn", a + QStringLiteral(": invalid transmitter slot %1 (expected 1 or 2)").arg(tx));
+        return;
+    }
+    emit logLine("cmd", QStringLiteral("→ %1 (%2)").arg(a, muted ? "muted" : "live"));
+    const auto slot = static_cast<Device::DevTXType>(tx);   // DevTXType is ONE-based
+    const int rc = ObsbotTws::setTxMute(m_dev.get(), slot, muted);
+    const bool ok = (rc == RM_RET_OK);
+    // rc is not proof — ask the device what it actually is now.
+    bool nowMuted = muted;
+    const bool readOk = (ObsbotTws::getTxMute(m_dev.get(), slot, nowMuted) == RM_RET_OK);
+    emit commandResult(a, ok, rc,
+                       ok ? (readOk ? (nowMuted ? QStringLiteral("muted") : QStringLiteral("live"))
+                                    : QStringLiteral("sent — the mic did not report back"))
+                          : QStringLiteral("failed"));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("%1  rc=%2%3").arg(a).arg(rc)
+                                         .arg(ok && readOk && nowMuted != muted
+                                                  ? QStringLiteral(" — but the mic reports %1")
+                                                        .arg(nowMuted ? "muted" : "live")
+                                                  : QString()));
+    cmdReadTwsInfo();   // the mic cards read from DevTWSInfo, so refresh that too
+}
+
+// PER-MIC gain, in the device's OWN units.
+//
+// The SDK documents no range for this and the app must not invent one: `gain` is
+// whatever the camera last reported for this slot, plus or minus the UI's step,
+// clamped ONLY to the int8 that DevTWSInfo::micN_gain can carry back. The
+// readback below is what makes that honest — if the camera clamps the value to
+// its real limits, the log says where it actually landed instead of the UI
+// pretending the request took.
+void CameraWorker::cmdSetTxGain(int tx, int gain) {
+    const QString a = QStringLiteral("mic gain tx%1").arg(tx);
+    if (!requireDevice(a)) return;
+    if (tx != Device::DevTX1 && tx != Device::DevTX2) {
+        emit commandResult(a, false, -1, QStringLiteral("invalid transmitter slot"));
+        emit logLine("warn", a + QStringLiteral(": invalid transmitter slot %1 (expected 1 or 2)").arg(tx));
+        return;
+    }
+    const int g = gain < kTxGainMin ? kTxGainMin : (gain > kTxGainMax ? kTxGainMax : gain);
+    emit logLine("cmd", QStringLiteral("→ %1 = %2 (device units — the SDK documents no range)").arg(a).arg(g));
+    const auto slot = static_cast<Device::DevTXType>(tx);
+    const int rc = ObsbotTws::setTxGain(m_dev.get(), slot, g);
+    const bool ok = (rc == RM_RET_OK);
+    int nowGain = g;
+    const bool readOk = (ObsbotTws::getTxGain(m_dev.get(), slot, nowGain) == RM_RET_OK);
+    emit commandResult(a, ok, rc,
+                       ok ? (readOk ? QString::number(nowGain) : QStringLiteral("sent — no readback"))
+                          : QStringLiteral("failed"));
+    emit logLine(ok ? "ok" : "warn",
+                 QStringLiteral("%1 = %2  rc=%3%4").arg(a).arg(g).arg(rc)
+                     .arg(ok && readOk && nowGain != g
+                              ? QStringLiteral(" — the mic settled at %1 (a real bound of the "
+                                               "undocumented range)").arg(nowGain)
+                              : QString()));
+    cmdReadTwsInfo();
 }
 
 // Assign the mic's multi-function button. Device::DevTWSKeyType maps 1:1 onto
@@ -765,7 +1027,42 @@ void CameraWorker::cmdSetMicButtonAction(int idx) {
     emit commandResult(a, ok, rc, ok ? QStringLiteral("applied") : QStringLiteral("failed"));
     emit logLine(ok ? "ok" : "warn", QStringLiteral("mic button = %1  rc=%2").arg(idx).arg(rc));
     statusPulse();
-    cmdReadTwsInfo();   // confirm from the device rather than trusting rc alone
+    // Confirm from the device rather than trusting rc alone — but POLL for it.
+    // The camera goes on reporting the old assignment for anywhere between a
+    // third of a second and three seconds (see kKeyConfirmIntervalMs), so a
+    // single read here is a coin flip that almost always lands wrong.
+    if (ok) startKeyConfirm(idx);
+    else    cmdReadTwsInfo();
+}
+
+// Poll cameraGetTWSInfoR until the camera reports `target`, or the budget runs
+// out. Every tick emits the usual twsInfo signal, so the UI clears its
+// optimistic override the moment the device agrees — and a late-but-successful
+// write is still caught instead of being reported as a failure.
+void CameraWorker::startKeyConfirm(int target) {
+    m_keyConfirmTarget = target;
+    m_keyConfirmTicksLeft = kKeyConfirmBudgetMs / kKeyConfirmIntervalMs;
+    if (!m_keyConfirmTimer) {
+        m_keyConfirmTimer = new QTimer(this);
+        m_keyConfirmTimer->setInterval(kKeyConfirmIntervalMs);
+        connect(m_keyConfirmTimer, &QTimer::timeout, this, &CameraWorker::onKeyConfirmTick);
+    }
+    m_keyConfirmTimer->start();
+}
+
+void CameraWorker::onKeyConfirmTick() {
+    if (m_shuttingDown || !m_dev) { m_keyConfirmTimer->stop(); return; }
+    const int got = readTwsInfo();
+    if (got == m_keyConfirmTarget) {
+        m_keyConfirmTimer->stop();
+        return;
+    }
+    if (--m_keyConfirmTicksLeft <= 0) {
+        m_keyConfirmTimer->stop();
+        emit logLine("warn", QStringLiteral("mic button: camera still reports %1 after %2 ms "
+                                            "(asked for %3)")
+                                 .arg(got).arg(kKeyConfirmBudgetMs).arg(m_keyConfirmTarget));
+    }
 }
 
 // Two readbacks in one cheap call. has_pair_record == 0 means this camera has
@@ -1154,8 +1451,11 @@ void CameraWorker::shutdown() {
     if (m_velocityWatchdog) m_velocityWatchdog->stop();
     if (m_dev) {
         // Disable the status push BEFORE dropping the device so no further
-        // sdkStatusTrampoline fires against state we are tearing down.
+        // sdkStatusTrampoline fires against state we are tearing down. Same for
+        // the device event callback, which captures `this` (setDevEventCallback
+        // swaps in a no-op rather than an empty std::function — see its comment).
         m_dev->enableDevStatusCallback(false);
+        setDevEventCallback(false);
         m_dev.reset();
     }
     // Stop the SDK's discovery task and drop the plug/unplug callback.

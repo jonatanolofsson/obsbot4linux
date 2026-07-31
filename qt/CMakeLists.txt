@@ -33,6 +33,7 @@ endif()
 
 qt_add_executable(obsbot4linux
     src/main.cpp
+    src/AudioMeter.cpp
     src/CameraController.cpp
     src/CameraWorker.cpp
     src/PreviewEngine.cpp
