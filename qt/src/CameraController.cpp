@@ -169,6 +169,7 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     connect(m_worker, &CameraWorker::zoomUpdate, this, &CameraController::onZoomUpdate);
     connect(m_worker, &CameraWorker::imageParams, this, &CameraController::onImageParams);
     connect(m_worker, &CameraWorker::whiteBalance, this, &CameraController::onWhiteBalance);
+    connect(m_worker, &CameraWorker::exposureState, this, &CameraController::onExposureState);
     connect(m_worker, &CameraWorker::commandResult, this, &CameraController::onWorkerResult);
     connect(m_worker, &CameraWorker::presetCaptured, this, &CameraController::onPresetCaptured);
     connect(m_worker, &CameraWorker::micStatus, this, &CameraController::onMicStatus);
@@ -1190,6 +1191,23 @@ void CameraController::setWhiteBalanceKelvin(int kelvin) {
     if (v > m_wbMax) v = m_wbMax;
     QMetaObject::invokeMethod(m_worker, "cmdSetWhiteBalance", Qt::QueuedConnection,
                               Q_ARG(bool, false), Q_ARG(int, v));
+}
+
+void CameraController::onExposureState(bool supported, int ev) {
+    m_capExposure = supported;
+    if (supported) m_evBias = ev;
+    emit exposureChanged();
+}
+
+// No optimistic override: the camera reports the new bias back promptly, and
+// the readback is what drives the UI.
+void CameraController::setEvBias(int ev) {
+    if (!connected() || !m_capExposure) {
+        emit logLine("warn", QStringLiteral("exposure: not available on this camera"));
+        return;
+    }
+    const int v = ev < 0 ? 0 : (ev > 18 ? 18 : ev);
+    QMetaObject::invokeMethod(m_worker, "cmdSetEvBias", Qt::QueuedConnection, Q_ARG(int, v));
 }
 
 void CameraController::onZoomUpdate(double zoom, bool valid) {

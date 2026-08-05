@@ -6,8 +6,9 @@
 //   * White balance — WIRED (auto/manual + Kelvin, range read from the device).
 //     In auto the camera does NOT report the temperature it is using, so the UI
 //     says so instead of showing the stale number it does report.
-//   * Exposure — still capability-gated OFF (not verified on the Tiny 3 SDK),
-//     shown disabled with an honest hint.
+//   * Exposure — WIRED as EV compensation (-3..+3 EV). The SDK marks these
+//     "tail air" but a Tiny 3 answers them, so the panel is gated on a runtime
+//     probe. Measured: +1.3 EV raised mean luma ~42 -> ~61-81.
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls.Basic
@@ -38,6 +39,10 @@ RowLayout {
         // is not meaningful in the current mode — white balance in auto, where
         // the camera reports a stored setting rather than what it is using.
         property string valueText: ""
+        // Live formatter: function(value) -> string. Unlike valueText this is
+        // evaluated as the handle moves, which a stepped-enum control needs —
+        // EV bias is an index 0..18 that must read as "+1.3 EV", not "13".
+        property var format: null
         property int pillWidth: 40
         signal applied(int value)
 
@@ -114,7 +119,8 @@ RowLayout {
             Text {
                 anchors.centerIn: parent
                 text: row.valueText !== "" ? row.valueText
-                                             : Math.round(sl.value) + row.suffix
+                      : row.format ? row.format(Math.round(sl.value))
+                      : Math.round(sl.value) + row.suffix
                 color: sl.pressed ? Theme.accentSoft : Theme.fg
                 font.family: Theme.mono; font.pixelSize: 13
             }
@@ -242,6 +248,52 @@ RowLayout {
     // reference preview — fixed size, roomy enough to judge image tweaks by
     // (300x220 was too tiny; fill-the-page swallowed the controls — don't).
     GlassPanel {
+        // EXPOSURE COMPENSATION — live. The camera runs its own auto exposure;
+        // this biases it. The SDK marks every exposure call "tail air", but a
+        // Tiny 3 answers them, so the panel is gated on a runtime probe rather
+        // than on the header's word.
+        //
+        // It replaced a disabled ["Auto", "-1 EV", "+1 EV"] segment. Three
+        // buttons could not express the control anyway: the device takes 19
+        // steps across -3..+3 EV, and "Auto" was never a mode here — the
+        // exposure is always automatic, this only shifts its target.
+        GlassPanel {
+            Layout.fillWidth: true
+            visible: cam.capExposure
+            implicitHeight: excol.implicitHeight + 28
+            ColumnLayout {
+                id: excol
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: Theme.s3
+                enabled: cam.connected
+                SectionLabel { text: "Exposure" }
+                ImageSlider {
+                    Layout.fillWidth: true
+                    label: "EV bias"
+                    boundValue: cam.evBias
+                    fromValue: 0            // DevAEEvBias_NEG_3_0
+                    toValue: 18             // DevAEEvBias_3_0
+                    stepValue: 1
+                    pillWidth: 72
+                    // Index -> stops. (v-9)/3 reproduces the SDK's own labels
+                    // exactly, including its uneven .3/.7 rounding.
+                    format: (v) => {
+                        const ev = (v - 9) / 3
+                        return (ev > 0 ? "+" : ev < 0 ? "\u2212" : "") + Math.abs(ev).toFixed(1) + " EV"
+                    }
+                    onApplied: (v) => cam.setEvBias(v)
+                }
+                Text {
+                    text: "Raises or lowers what the camera's auto exposure aims for. "
+                          + "Underexposed video is the usual cause of both graininess and "
+                          + "flat colour, so nudge this up in a dim room \u2014 at the cost of "
+                          + "blowing out bright areas."
+                    color: Theme.dimmer; font.family: Theme.mono; font.pixelSize: 11
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap
+                }
+            }
+        }
         Layout.preferredWidth: 460
         Layout.maximumWidth: 480
         Layout.preferredHeight: 310

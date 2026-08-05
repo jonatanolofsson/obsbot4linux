@@ -311,6 +311,7 @@ void CameraWorker::bindDevice(const std::shared_ptr<Device> &d) {
     // White balance: one read that doubles as the capability probe (it reports
     // the device's own range, which the UI needs before it can show a slider).
     cmdReadWhiteBalance();
+    cmdReadExposure();
 
     // Wireless mic: probe the undocumented TWS API once (cmdReadTwsInfo sets
     // m_twsSupported from the rc and emits the result either way), then keep
@@ -916,6 +917,56 @@ void CameraWorker::cmdSetWhiteBalance(bool autoMode, int kelvin) {
                      ? QStringLiteral("white balance = auto  rc=%1").arg(rc)
                      : QStringLiteral("white balance = %1 K  rc=%2").arg(kelvin).arg(rc));
     cmdReadWhiteBalance();   // the device's own value drives the UI, not our request
+}
+
+// EXPOSURE COMPENSATION (EV bias).
+//
+// The SDK marks every exposure call "@category tail air", but the Tiny 3 answers
+// them — the same way it fires device events the header says are Tail-Air-only.
+// Verified on fw 6.6.8.25, and it is a REAL control, not just an answering
+// getter: setting +1.3 EV raised measured mean luma from ~42 to ~61-81 across
+// three interleaved A/B rounds (interleaved because ambient light drifts enough
+// to fake a result otherwise).
+//
+// USE THE P-GEAR SETTER. There are three: P (program), A (aperture priority) and
+// S (shutter priority). cameraGetExposureModeR reports DevExposureAllAuto on a
+// Tiny 3, which is the P gear — and cameraSetAAEEvBiasR returns rc=0 while doing
+// nothing at all, since aperture priority is meaningless on a fixed-aperture
+// webcam. An earlier attempt used the A-gear setter and produced pure noise:
+// readbacks that never matched the request and luma that moved with the room
+// lights rather than the setting.
+//
+// Range is the DevAEEvBiasType enum, 0..18 in thirds of a stop with 9 == 0 EV.
+// That is an enum, not a device-reported range, so it is the one place here a
+// constant is honest — the SDK defines the values.
+void CameraWorker::cmdReadExposure() {
+    if (!m_dev) return;
+    int32_t mode = -1;
+    const int mrc = m_dev->cameraGetExposureModeR(mode);
+    int32_t ev = -999;
+    const int erc = m_dev->cameraGetPAEEvBiasR(ev);
+    const bool ok = (mrc == RM_RET_OK && erc == RM_RET_OK && ev >= 0 && ev <= 18);
+    if (!m_expProbed || ok != m_expSupported) {
+        m_expProbed = true;
+        m_expSupported = ok;
+        emit logLine(ok ? "sys" : "warn",
+                     ok ? QStringLiteral("exposure: EV compensation available (mode=%1, bias=%2)")
+                              .arg(mode).arg(ev)
+                        : QStringLiteral("exposure: EV compensation unavailable "
+                                         "(mode rc=%1, bias rc=%2) — control disabled").arg(mrc).arg(erc));
+    }
+    emit exposureState(ok, ok ? ev : 9);
+}
+
+void CameraWorker::cmdSetEvBias(int ev) {
+    const QString a = QStringLiteral("exposure");
+    if (!requireDevice(a)) return;
+    const int v = ev < 0 ? 0 : (ev > 18 ? 18 : ev);
+    const int rc = m_dev->cameraSetPAEEvBiasR(v);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, QStringLiteral("EV index %1").arg(v));
+    emit logLine(ok ? "ok" : "warn", QStringLiteral("exposure: EV bias = %1  rc=%2").arg(v).arg(rc));
+    cmdReadExposure();   // the device's own value drives the UI
 }
 
 void CameraWorker::cmdReadImageParams() {

@@ -94,6 +94,9 @@ class CameraController : public QObject {
     Q_PROPERTY(int wbMin MEMBER m_wbMin NOTIFY whiteBalanceChanged)
     Q_PROPERTY(int wbMax MEMBER m_wbMax NOTIFY whiteBalanceChanged)
     Q_PROPERTY(int wbStep MEMBER m_wbStep NOTIFY whiteBalanceChanged)
+    // Exposure compensation: DevAEEvBiasType index 0..18, 9 == 0 EV. The bounds
+    // are the SDK's own enum, not a device-reported range.
+    Q_PROPERTY(int evBias MEMBER m_evBias NOTIFY exposureChanged)
 
     // ----- capability gating -----
     Q_PROPERTY(bool capAi READ capAi CONSTANT)
@@ -107,6 +110,9 @@ class CameraController : public QObject {
     // Runtime probe, not a constant: true once the camera answered
     // cameraGetRangeWhiteBalanceR + cameraGetWhiteBalanceR on connect.
     Q_PROPERTY(bool capWhiteBalance MEMBER m_capWhiteBalance NOTIFY whiteBalanceChanged)
+    // Runtime probe: the camera answered the exposure getters. The SDK marks
+    // these "tail air" but a Tiny 3 answers them — hence a probe, not a constant.
+    Q_PROPERTY(bool capExposure MEMBER m_capExposure NOTIFY exposureChanged)
 
     // ----- presets + external-preview fallback -----
     Q_PROPERTY(QVariantList presets READ presets NOTIFY presetsChanged)
@@ -308,6 +314,8 @@ public slots:
     // to its step, so the UI cannot ask for a value the camera would reject.
     void setWhiteBalanceAuto(bool on);
     void setWhiteBalanceKelvin(int kelvin);
+    // ev is the DevAEEvBiasType index 0..18 (9 == 0 EV), clamped here.
+    void setEvBias(int ev);
     void rescan();
     void launchPreview();   // FALLBACK: (re)launch the external ffplay preview
     void stopPreview();     // terminate the ffplay preview (also called on shutdown)
@@ -371,6 +379,7 @@ signals:
     void aiChanged();
     void imageChanged();
     void whiteBalanceChanged();
+    void exposureChanged();
     void settingsChanged();
     void presetsChanged();
     void logLine(const QString &kind, const QString &message);
@@ -389,6 +398,7 @@ private slots:
     void onZoomUpdate(double zoom, bool valid);
     void onImageParams(int brightness, int contrast, int saturation, int sharpness);
     void onWhiteBalance(bool supported, bool autoMode, int kelvin, int kmin, int kmax, int kstep);
+    void onExposureState(bool supported, int ev);
     void onWorkerResult(const QString &action, bool ok, int rc, const QString &message);
     void onPresetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
     void onMicStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning,
@@ -472,6 +482,8 @@ private:
     // reports one, capWhiteBalance is false and the UI shows no slider, so
     // there is never a moment where a plausible-looking but invented range is
     // on screen.
+    bool m_capExposure = false;
+    int m_evBias = 9;               // DevAEEvBias_0
     bool m_capWhiteBalance = false;
     bool m_wbAuto = true;
     int m_wbKelvin = 0;

@@ -63,6 +63,11 @@ public slots:
     // bounds are inverted garbage and must not be used).
     void cmdReadWhiteBalance();
     void cmdSetWhiteBalance(bool autoMode, int kelvin);
+    // Exposure compensation. cmdReadExposure doubles as the capability probe.
+    // ev is the DevAEEvBiasType index 0..18, 9 == 0 EV. See the .cpp for why the
+    // P-gear setter is the only one that works on this camera.
+    void cmdReadExposure();
+    void cmdSetEvBias(int ev);
     void cmdPresetCapture(int idx);
     void cmdPresetGo(int idx, double pitch, double yaw, double zoom, int fov, double speed);
 
@@ -182,6 +187,9 @@ signals:
     // camera did not answer the range/get pair and the control stays disabled;
     // the remaining fields are meaningless in that case.
     void whiteBalance(bool supported, bool autoMode, int kelvin, int kmin, int kmax, int kstep);
+    // supported=false => the camera did not answer the exposure getters and the
+    // control stays disabled; ev is the DevAEEvBiasType index (9 == 0 EV).
+    void exposureState(bool supported, int ev);
     void commandResult(const QString &action, bool ok, int rc, const QString &message);
     void presetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
     // Wireless-mic PRESENCE, straight from the status push's tiny.wireless_mic.
@@ -319,6 +327,8 @@ private:
     // Same first-verdict-always-logs pattern for the white-balance probe.
     bool m_wbSupported = false;
     bool m_wbProbed = false;
+    bool m_expSupported = false;
+    bool m_expProbed = false;
     // Same pair for the camera-audio API (cameraGetAudioVolumeR answered). Kept
     // separate from m_twsSupported: a camera can perfectly well have a working
     // mic array and no wireless-mic support, or the reverse.
