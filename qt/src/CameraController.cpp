@@ -1,5 +1,6 @@
 #include "CameraController.h"
 #include "CameraWorker.h"
+#include "ObsbotVideoNode.h"
 #include "PreviewFormats.h"
 
 #include <QClipboard>
@@ -59,10 +60,14 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     m_settings = Settings::load();
     m_aiModeName = QStringLiteral("Off");
 
-    // ffplay fallback availability: ffplay present AND a /dev/video0 node exists.
-    // (The embedded preview has its own by-name device detection in PreviewEngine.)
+    // ffplay fallback availability: ffplay present AND an OBSBOT capture node
+    // exists. This used to test QFileInfo::exists("/dev/video0"), which is the
+    // built-in webcam on any laptop — the gate passed for the wrong camera and
+    // the fallback then opened it. Resolved by card name, like the embedded
+    // preview. (Startup-time only, hence CONSTANT; startPreview re-resolves, so
+    // plugging the camera in later still works even if this said false.)
     m_previewAvailable = !QStandardPaths::findExecutable("ffplay").isEmpty()
-                         && QFileInfo::exists("/dev/video0");
+                         && !ObsbotVideoNode::find().isEmpty();
 
     m_pendingTimer = new QTimer(this);
     m_pendingTimer->setSingleShot(true);
@@ -730,8 +735,16 @@ void CameraController::launchPreview() {
     // embedded preview (PreviewEngine) for boxes where QtMultimedia misbehaves.
     // Occupies the UVC node — conflicts with the embedded preview and with
     // browser/Meet/OBS camera use, exactly like any other capture client.
-    if (!m_previewAvailable) {
-        emit logLine("warn", QStringLiteral("preview: ffplay or /dev/video0 not available"));
+    // Resolve the node NOW rather than reusing whatever was found at startup:
+    // the camera may have been plugged in since, and its node number can change
+    // across replug.
+    const QString devPath = ObsbotVideoNode::find();
+    if (devPath.isEmpty()) {
+        emit logLine("warn", QStringLiteral("preview: no OBSBOT capture node found under /dev/video*"));
+        return;
+    }
+    if (QStandardPaths::findExecutable("ffplay").isEmpty()) {
+        emit logLine("warn", QStringLiteral("preview: ffplay not found on PATH"));
         return;
     }
     stopPreview();   // kill any existing preview first (also used to reload on res change)
@@ -755,10 +768,10 @@ void CameraController::launchPreview() {
         "-video_size", QStringLiteral("%1x%2").arg(pr.w).arg(pr.h),
         "-framerate", QString::number(pr.fps),
         "-window_title", QStringLiteral("OBSBOT preview (%1)").arg(QString::fromLatin1(pr.label)),
-        "/dev/video0"};
+        devPath};
     m_previewProc->start(QStringLiteral("ffplay"), args);
-    emit logLine("cmd", QStringLiteral("preview: launched ffplay at %1 (external window, fallback)")
-                            .arg(QString::fromLatin1(pr.label)));
+    emit logLine("cmd", QStringLiteral("preview: launched ffplay on %1 at %2 (external window, fallback)")
+                            .arg(devPath, QString::fromLatin1(pr.label)));
 }
 
 void CameraController::copyToClipboard(const QString &text) {

@@ -36,6 +36,7 @@ qt_add_executable(obsbot4linux
     src/AudioMeter.cpp
     src/CameraController.cpp
     src/CameraWorker.cpp
+    src/ObsbotVideoNode.cpp
     src/PreviewEngine.cpp
     src/Settings.cpp
 )

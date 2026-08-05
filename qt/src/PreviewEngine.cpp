@@ -1,5 +1,6 @@
 #include "PreviewEngine.h"
 #include "JpegDht.h"
+#include "ObsbotVideoNode.h"
 #include "PreviewFormats.h"
 
 #include <QDir>
@@ -269,36 +270,12 @@ void PreviewEngine::setVideoSink(QVideoSink *sink) {
 }
 
 void PreviewEngine::refreshDevice() {
-    // Scan /dev/video* and pick the first CAPTURE node whose driver-reported
-    // card name contains "OBSBOT". Metadata nodes (e.g. /dev/video1) report the
-    // same card but lack V4L2_CAP_VIDEO_CAPTURE, so they're skipped naturally.
+    // The scan lives in ObsbotVideoNode so the ffplay fallback resolves the
+    // device the same way this does — it used to hardcode /dev/video0 and open
+    // the laptop's built-in webcam.
     const bool wasAvailable = available();
     const QString oldPath = m_devPath;
-    QString found;
-
-    QStringList nodes = QDir(QStringLiteral("/dev"))
-                            .entryList({QStringLiteral("video*")}, QDir::System | QDir::Files);
-    // Numeric order (lexical puts video10 before video2) so the pick is stable
-    // across boots when several nodes exist.
-    std::sort(nodes.begin(), nodes.end(), [](const QString &a, const QString &b) {
-        return a.mid(5).toInt() < b.mid(5).toInt();
-    });
-    for (const QString &n : nodes) {
-        const QString path = QStringLiteral("/dev/") + n;
-        const int fd = ::open(path.toLocal8Bit().constData(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
-        v4l2_capability cap{};
-        const bool ok = (xioctl(fd, VIDIOC_QUERYCAP, &cap) == 0);
-        ::close(fd);
-        if (!ok) continue;
-        const __u32 caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps
-                                                                     : cap.capabilities;
-        if (!(caps & V4L2_CAP_VIDEO_CAPTURE)) continue;
-        const QString card = QString::fromLatin1(reinterpret_cast<const char *>(cap.card));
-        if (!card.contains(QLatin1String("OBSBOT"), Qt::CaseInsensitive)) continue;
-        found = path;
-        break;
-    }
+    const QString found = ObsbotVideoNode::find();
 
     if (found == oldPath) return;   // no change (incl. both empty)
     m_devPath = found;
