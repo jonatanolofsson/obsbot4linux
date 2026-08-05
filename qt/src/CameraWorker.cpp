@@ -46,6 +46,11 @@ constexpr int kPairWakeSettleMs = 1200;
 // worst observed latency rather than the ~3 s that was nearly hit.
 constexpr int kKeyConfirmIntervalMs = 250;
 constexpr int kKeyConfirmBudgetMs   = 6000;
+// NOTE: there is deliberately NO periodic white-balance re-read. An earlier
+// version polled every 2 s so the slider could follow the camera in auto mode.
+// Measurement killed that idea — see cmdReadWhiteBalance for what auto actually
+// reports. Nothing changes behind our back in either mode, so polling would be
+// pure traffic for a number that never moves.
 // Per-mic gain bounds. NOT a documented range — the SDK gives none. This is the
 // only bound anyone can defend: DevTWSInfo carries the device's own reported gain
 // in an int8_t, so a value outside it could never be read back. The camera's real
@@ -303,6 +308,9 @@ void CameraWorker::bindDevice(const std::shared_ptr<Device> &d) {
     // Read real zoom + current image params once now (blocking getters, safe here).
     refreshZoom();
     cmdReadImageParams();
+    // White balance: one read that doubles as the capability probe (it reports
+    // the device's own range, which the UI needs before it can show a slider).
+    cmdReadWhiteBalance();
 
     // Wireless mic: probe the undocumented TWS API once (cmdReadTwsInfo sets
     // m_twsSupported from the rc and emits the result either way), then keep
@@ -841,6 +849,73 @@ void CameraWorker::cmdSetImage(const QString &param, int value) {
     const bool ok = (rc == RM_RET_OK);
     emit commandResult(param, ok, rc, QString::number(v));
     emit logLine(ok ? "ok" : "warn", QStringLiteral("%1 = %2  rc=%3").arg(param).arg(v).arg(rc));
+}
+
+// WHITE BALANCE. Public API (cameraSet/GetWhiteBalanceR, @category includes
+// "tiny"), so no shim — unlike the mic work, this needs nothing undocumented.
+//
+// HARDWARE FINDINGS on a Tiny 3 (fw 6.6.8.25), none of them in the header:
+//   * `param` is KELVIN. cameraGetRangeWhiteBalanceR answers 2000..10000
+//     step 100 default 5000 — identical to the UVC white_balance_temperature
+//     control, and a value written through one reads back through the other.
+//   * The range getter is authoritative; cameraGetWhiteBalanceListR is NOT. The
+//     list variant returns the supported MODE ids, and its wb_min/wb_max come
+//     back as min=10000 max=0 — inverted nonsense. Never source bounds there.
+//   * The readback is prompt: a written value was reported back within 250 ms,
+//     so unlike the mic button's key_cmd this needs no confirm poll.
+//
+// The bounds come from the device, never from a constant here: the SDK has no
+// documented range, and the one range that matters is the one this camera
+// reports. Failure to read them disables the control rather than guessing.
+void CameraWorker::cmdReadWhiteBalance() {
+    if (!m_dev) return;
+    Device::UvcParamRange range{};
+    const int rrc = m_dev->cameraGetRangeWhiteBalanceR(range);
+    Device::DevWhiteBalanceType mode = Device::DevWhiteBalanceAuto;
+    int32_t kelvin = 0;
+    const int grc = m_dev->cameraGetWhiteBalanceR(mode, kelvin);
+    const bool ok = (rrc == RM_RET_OK && grc == RM_RET_OK && range.valid_ && range.max_ > range.min_);
+    if (!m_wbProbed || ok != m_wbSupported) {
+        m_wbProbed = true;
+        m_wbSupported = ok;
+        emit logLine(ok ? "sys" : "warn",
+                     ok ? QStringLiteral("white balance: %1–%2 K step %3 (device-reported)")
+                              .arg(range.min_).arg(range.max_).arg(range.step_)
+                        : QStringLiteral("white balance: unavailable on this camera/firmware "
+                                         "(range rc=%1, get rc=%2) — control disabled").arg(rrc).arg(grc));
+    }
+    if (!ok) { emit whiteBalance(false, true, 0, 0, 0, 0); return; }
+    // MEASURED, not assumed: in AUTO the reported `param` is a stored setting,
+    // not what the camera is doing. Capturing frames and averaging the channels
+    // showed auto claiming 9000 K while the picture measured bluer than manual
+    // 6000 K, and a follow-up isolated it exactly — preceding auto with a manual
+    // 2500 then a manual 9500 made auto report 2500 then 9500 while the actual
+    // colour balance stayed put (B/R 1.589 vs 1.664, i.e. unchanged). The number
+    // simply echoes the last manual write. v4l2 says the same thing in one word:
+    // white_balance_temperature carries flags=inactive while auto is on.
+    //
+    // So the Kelvin value is passed through as-is and the UI is responsible for
+    // NOT presenting it as the current temperature while autoMode is true. There
+    // is no getter for what auto is actually using — not in the SDK, not over
+    // UVC — so the honest answer is to say so rather than show a number.
+    emit whiteBalance(true, mode == Device::DevWhiteBalanceAuto, kelvin,
+                      static_cast<int>(range.min_), static_cast<int>(range.max_),
+                      static_cast<int>(range.step_ > 0 ? range.step_ : 100));
+}
+
+// Auto ignores `kelvin` — the SDK's param is documented as meaningful only for
+// the manual mode, so it is not sent as a hidden second setting.
+void CameraWorker::cmdSetWhiteBalance(bool autoMode, int kelvin) {
+    const QString a = QStringLiteral("white balance");
+    if (!requireDevice(a)) return;
+    const auto mode = autoMode ? Device::DevWhiteBalanceAuto : Device::DevWhiteBalanceManual;
+    const int rc = m_dev->cameraSetWhiteBalanceR(mode, kelvin);
+    const bool ok = (rc == RM_RET_OK);
+    emit commandResult(a, ok, rc, autoMode ? QStringLiteral("auto") : QStringLiteral("%1 K").arg(kelvin));
+    emit logLine(ok ? "ok" : "warn", autoMode
+                     ? QStringLiteral("white balance = auto  rc=%1").arg(rc)
+                     : QStringLiteral("white balance = %1 K  rc=%2").arg(kelvin).arg(rc));
+    cmdReadWhiteBalance();   // the device's own value drives the UI, not our request
 }
 
 void CameraWorker::cmdReadImageParams() {

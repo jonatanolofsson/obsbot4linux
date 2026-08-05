@@ -168,6 +168,7 @@ CameraController::CameraController(QObject *parent) : QObject(parent) {
     connect(m_worker, &CameraWorker::auxStatus, this, &CameraController::onAuxStatus);
     connect(m_worker, &CameraWorker::zoomUpdate, this, &CameraController::onZoomUpdate);
     connect(m_worker, &CameraWorker::imageParams, this, &CameraController::onImageParams);
+    connect(m_worker, &CameraWorker::whiteBalance, this, &CameraController::onWhiteBalance);
     connect(m_worker, &CameraWorker::commandResult, this, &CameraController::onWorkerResult);
     connect(m_worker, &CameraWorker::presetCaptured, this, &CameraController::onPresetCaptured);
     connect(m_worker, &CameraWorker::micStatus, this, &CameraController::onMicStatus);
@@ -1139,6 +1140,56 @@ void CameraController::onImageParams(int brightness, int contrast, int saturatio
     m_saturation = saturation;
     m_sharpness = sharpness;
     emit imageChanged();
+}
+
+void CameraController::onWhiteBalance(bool supported, bool autoMode, int kelvin,
+                                      int kmin, int kmax, int kstep) {
+    m_capWhiteBalance = supported;
+    m_wbAuto = autoMode;
+    if (supported) {
+        m_wbKelvin = kelvin;
+        m_wbMin = kmin;
+        m_wbMax = kmax;
+        m_wbStep = kstep > 0 ? kstep : 100;
+    }
+    emit whiteBalanceChanged();
+}
+
+// ---------------------------------------------------------------------------
+// White balance. The camera owns the value: every set is followed by the
+// worker re-reading, and the readback drives the UI. There is no optimistic
+// override here because there is nothing to hide — the Tiny 3 reports a new
+// white-balance value back within ~250 ms, unlike the mic button's key_cmd.
+// ---------------------------------------------------------------------------
+void CameraController::setWhiteBalanceAuto(bool on) {
+    if (!connected() || !m_capWhiteBalance) {
+        emit logLine("warn", QStringLiteral("white balance: not available on this camera"));
+        return;
+    }
+    // Leaving auto needs a value to land on. The device's current reading is the
+    // honest starting point — it is what the picture looks like right now, so
+    // switching to manual does not visibly change the image until the user moves
+    // the slider. Falling back to the device default only if that is unusable.
+    const int kelvin = (m_wbKelvin >= m_wbMin && m_wbKelvin <= m_wbMax)
+                           ? m_wbKelvin
+                           : (m_wbMin + m_wbMax) / 2;
+    QMetaObject::invokeMethod(m_worker, "cmdSetWhiteBalance", Qt::QueuedConnection,
+                              Q_ARG(bool, on), Q_ARG(int, kelvin));
+}
+
+void CameraController::setWhiteBalanceKelvin(int kelvin) {
+    if (!connected() || !m_capWhiteBalance) {
+        emit logLine("warn", QStringLiteral("white balance: not available on this camera"));
+        return;
+    }
+    // Clamp and snap to what the DEVICE said it accepts, so the UI can never ask
+    // for an off-grid value and then look broken when the readback disagrees.
+    const int step = m_wbStep > 0 ? m_wbStep : 100;
+    int v = kelvin < m_wbMin ? m_wbMin : (kelvin > m_wbMax ? m_wbMax : kelvin);
+    v = m_wbMin + ((v - m_wbMin + step / 2) / step) * step;
+    if (v > m_wbMax) v = m_wbMax;
+    QMetaObject::invokeMethod(m_worker, "cmdSetWhiteBalance", Qt::QueuedConnection,
+                              Q_ARG(bool, false), Q_ARG(int, v));
 }
 
 void CameraController::onZoomUpdate(double zoom, bool valid) {

@@ -3,8 +3,11 @@
 //     values read on connect, applied on release).
 //   * HDR — NOT available on Tiny 3 (SDK HDR/WDR is for tiny4k/tiny2/meet/tail-
 //     air; Tiny 3 reports hdr_support=0 in every mode). Shown as an honest note.
-//   * White balance / Color temp / Exposure — still capability-gated OFF (not
-//     verified on the Tiny 3 SDK), shown disabled with an honest hint.
+//   * White balance — WIRED (auto/manual + Kelvin, range read from the device).
+//     In auto the camera does NOT report the temperature it is using, so the UI
+//     says so instead of showing the stale number it does report.
+//   * Exposure — still capability-gated OFF (not verified on the Tiny 3 SDK),
+//     shown disabled with an honest hint.
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls.Basic
@@ -19,17 +22,69 @@ RowLayout {
     component ImageSlider: RowLayout {
         id: row
         property string label: ""
+        // When set, the value is applied with setImageParam(param, v). Leave it
+        // empty and handle `applied` instead for a control with its own setter
+        // — white balance does that, so it gets this exact look rather than a
+        // second slider style drawn by hand.
         property string param: ""
         property int boundValue: 50
+        // Range defaults to the 0–100 the image params use; white balance
+        // overrides them with the range the DEVICE reported.
+        property int fromValue: 0
+        property int toValue: 100
+        property int stepValue: 1
+        property string suffix: ""      // appended in the value pill, e.g. " K"
+        // When set, REPLACES the number in the pill. For a control whose value
+        // is not meaningful in the current mode — white balance in auto, where
+        // the camera reports a stored setting rather than what it is using.
+        property string valueText: ""
+        property int pillWidth: 40
+        signal applied(int value)
+
+        // Keeping the handle on the device's value takes an explicit sync, not a
+        // `value: boundValue` binding. Two reasons, both of which produced real
+        // bugs here:
+        //
+        //   * Dragging a Slider assigns `value` imperatively and DESTROYS any
+        //     binding on it, so after one drag the handle stops following the
+        //     device permanently.
+        //   * A Slider clamps `value` to whatever from/to are at that moment.
+        //     The white-balance range arrives from the camera AFTER this page is
+        //     built, so the first reading was clamped into a 0..0 range and the
+        //     slider opened pinned at 2000 K while the camera was at 6000 K —
+        //     and never recovered, because boundValue never changed again.
+        //     Hence syncing on the RANGE changing too, not just the value.
+        //
+        // Syncing on CHANGE rather than binding continuously also avoids a bounce
+        // on release: the write goes out, the camera confirms ~250 ms later, and
+        // only then does boundValue move — to exactly where the handle already
+        // is. A continuous binding would instead snap back to the stale value for
+        // that quarter second and then jump forward again.
+        function syncFromDevice() {
+            if (sl.pressed) return              // never fight a drag in progress
+            if (row.toValue <= row.fromValue) return   // range not known yet
+            sl.value = Math.min(Math.max(row.boundValue, row.fromValue), row.toValue)
+        }
+        onBoundValueChanged: syncFromDevice()
+        onFromValueChanged: syncFromDevice()
+        onToValueChanged: syncFromDevice()
+        Component.onCompleted: syncFromDevice()
+
         spacing: 10
         Text { text: row.label; color: Theme.fg; font.family: Theme.mono; font.pixelSize: 13; Layout.preferredWidth: 96 }
         Slider {
             id: sl
             Layout.fillWidth: true
-            enabled: cam.connected
-            from: 0; to: 100; stepSize: 1
-            value: row.boundValue
-            onPressedChanged: if (!pressed) cam.setImageParam(row.param, Math.round(value))
+            // `row.enabled` so a caller can gate the slider (WB does, while the
+            // camera is in auto) without losing the connected() requirement.
+            enabled: cam.connected && row.enabled
+            from: row.fromValue; to: row.toValue; stepSize: row.stepValue
+            onPressedChanged: {
+                if (pressed) return
+                const v = Math.round(value)
+                if (row.param !== "") cam.setImageParam(row.param, v)
+                else row.applied(v)
+            }
             opacity: enabled ? 1 : 0.4
 
             background: Rectangle {
@@ -52,13 +107,14 @@ RowLayout {
         }
         // Value pill — prominent, coral when dragging, tabular so it doesn't jitter.
         Rectangle {
-            Layout.preferredWidth: 40; Layout.preferredHeight: 24
+            Layout.preferredWidth: row.pillWidth; Layout.preferredHeight: 24
             radius: Theme.rControl
             color: sl.pressed ? Theme.accentTint : Qt.rgba(1, 1, 1, 0.04)
             border.width: 1; border.color: sl.pressed ? Theme.accentRing : Theme.border
             Text {
                 anchors.centerIn: parent
-                text: Math.round(sl.value)
+                text: row.valueText !== "" ? row.valueText
+                                             : Math.round(sl.value) + row.suffix
                 color: sl.pressed ? Theme.accentSoft : Theme.fg
                 font.family: Theme.mono; font.pixelSize: 13
             }
@@ -114,44 +170,73 @@ RowLayout {
             }
         }
 
-        // still-gated controls (WB / color temp / exposure)
-        Rectangle {
-            Layout.fillWidth: true
-            radius: Theme.rControl
-            color: Qt.rgba(Theme.degraded.r, Theme.degraded.g, Theme.degraded.b, 0.10)
-            border.width: 1
-            border.color: Qt.rgba(Theme.degraded.r, Theme.degraded.g, Theme.degraded.b, 0.4)
-            implicitHeight: banner.implicitHeight + 20
-            Text {
-                id: banner
-                anchors.fill: parent; anchors.margins: 10
-                text: "White balance, color temperature and exposure are disabled — " + cam.capUnverifiedReason
-                color: Theme.degraded
-                font.family: Theme.mono; font.pixelSize: 12
-                wrapMode: Text.WordWrap
-            }
-        }
+        // White balance — LIVE. The camera answers cameraGetRangeWhiteBalanceR,
+        // so the range below is the device's own (2000–10000 K step 100 on a
+        // Tiny 3), never a constant in this file. If it ever stops answering,
+        // capWhiteBalance goes false and the whole panel disappears rather than
+        // offering a slider bound to invented limits.
         GlassPanel {
             Layout.fillWidth: true
-            implicitHeight: gcol.implicitHeight + 28
+            visible: cam.capWhiteBalance
+            implicitHeight: wbcol.implicitHeight + 28
             ColumnLayout {
-                id: gcol
+                id: wbcol
                 anchors.fill: parent
                 anchors.margins: 14
                 spacing: Theme.s3
-                enabled: false
+                enabled: cam.connected
                 RowLayout {
                     spacing: 10
-                    Text { text: "White balance"; color: Theme.dim; font.family: Theme.mono; font.pixelSize: 12; Layout.preferredWidth: 96 }
-                    Segmented { options: ["Auto", "Manual"]; currentIndex: 0; enabled: false }
+                    Text {
+                        text: "White balance"; color: Theme.dim
+                        font.family: Theme.mono; font.pixelSize: 12; Layout.preferredWidth: 96
+                    }
+                    Segmented {
+                        options: ["Auto", "Manual"]
+                        // Bound to the DEVICE's mode, so an externally-made
+                        // change (v4l2, another app) shows up here instead of
+                        // the UI insisting on its own last click.
+                        currentIndex: cam.wbAuto ? 0 : 1
+                        onActivated: (i) => cam.setWhiteBalanceAuto(i === 0)
+                    }
                 }
-                RowLayout {
-                    spacing: 10
-                    Text { text: "Exposure"; color: Theme.dim; font.family: Theme.mono; font.pixelSize: 12; Layout.preferredWidth: 96 }
-                    Segmented { options: ["Auto", "−1 EV", "+1 EV"]; currentIndex: 0; enabled: false }
+                // Same slider as brightness/contrast above — deliberately, so the
+                // page reads as one control surface.
+                //
+                // In AUTO the pill says "auto" instead of a number. The camera
+                // does report a Kelvin value in that mode, but it is a stored
+                // setting rather than what auto is using: writing manual 2500
+                // then switching to auto makes it report 2500, writing 9500 makes
+                // it report 9500, and the actual picture is the same either way
+                // (measured off captured frames). Showing it would be inventing a
+                // reading. Nothing in the SDK or over UVC exposes the real one.
+                ImageSlider {
+                    Layout.fillWidth: true
+                    label: "Temp"
+                    enabled: !cam.wbAuto
+                    boundValue: cam.wbKelvin
+                    fromValue: cam.wbMin
+                    toValue: cam.wbMax
+                    stepValue: cam.wbStep
+                    suffix: " K"
+                    valueText: cam.wbAuto ? "auto" : ""
+                    pillWidth: 62
+                    onApplied: (v) => cam.setWhiteBalanceKelvin(v)
+                }
+                Text {
+                    text: cam.wbAuto
+                          ? "The camera is choosing the white balance. It does not report which "
+                            + "temperature it settled on, so the slider shows the last manual "
+                            + "setting, not what you are seeing — switch to Manual to control it."
+                          : "Lower is bluer, higher is warmer — it is the colour of the light you "
+                            + "are telling the camera to expect, not the tint it applies. "
+                            + cam.wbMin + "–" + cam.wbMax + " K."
+                    color: Theme.dimmer; font.family: Theme.mono; font.pixelSize: 11
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap
                 }
             }
         }
+
     }
 
     // reference preview — fixed size, roomy enough to judge image tweaks by

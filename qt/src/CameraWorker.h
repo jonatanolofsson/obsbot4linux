@@ -55,6 +55,14 @@ public slots:
     void cmdSetMicSleep(bool on);
     void cmdSetImage(const QString &param, int value); // brightness/contrast/saturation/sharpness (0–100)
     void cmdReadImageParams();                         // read current image params on connect
+    // White balance. Public SDK API (@category includes "tiny"), so no shim.
+    // cmdReadWhiteBalance doubles as the capability probe AND supplies the
+    // device's own Kelvin range — the UI cannot draw the slider without it, and
+    // nothing here hardcodes bounds the SDK does not document. See the .cpp for
+    // what the hardware actually reports (param is Kelvin; the *List* getter's
+    // bounds are inverted garbage and must not be used).
+    void cmdReadWhiteBalance();
+    void cmdSetWhiteBalance(bool autoMode, int kelvin);
     void cmdPresetCapture(int idx);
     void cmdPresetGo(int idx, double pitch, double yaw, double zoom, int fov, double speed);
 
@@ -170,6 +178,10 @@ signals:
     void auxStatus(bool faceFocus, bool hdrOn, bool hdrSupport, int fps, int sleepMicro, int autoSleepSec);
     void zoomUpdate(double zoom, bool valid);
     void imageParams(int brightness, int contrast, int saturation, int sharpness);
+    // White balance state + the device's OWN range. supported=false means the
+    // camera did not answer the range/get pair and the control stays disabled;
+    // the remaining fields are meaningless in that case.
+    void whiteBalance(bool supported, bool autoMode, int kelvin, int kmin, int kmax, int kstep);
     void commandResult(const QString &action, bool ok, int rc, const QString &message);
     void presetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
     // Wireless-mic PRESENCE, straight from the status push's tiny.wireless_mic.
@@ -304,6 +316,9 @@ private:
     // m_twsProbed makes the FIRST verdict always log, including a negative one.
     bool m_twsSupported = false;
     bool m_twsProbed = false;
+    // Same first-verdict-always-logs pattern for the white-balance probe.
+    bool m_wbSupported = false;
+    bool m_wbProbed = false;
     // Same pair for the camera-audio API (cameraGetAudioVolumeR answered). Kept
     // separate from m_twsSupported: a camera can perfectly well have a working
     // mic array and no wireless-mic support, or the reverse.

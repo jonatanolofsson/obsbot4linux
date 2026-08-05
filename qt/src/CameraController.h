@@ -86,6 +86,14 @@ class CameraController : public QObject {
     Q_PROPERTY(int contrast MEMBER m_contrast NOTIFY imageChanged)
     Q_PROPERTY(int saturation MEMBER m_saturation NOTIFY imageChanged)
     Q_PROPERTY(int sharpness MEMBER m_sharpness NOTIFY imageChanged)
+    // White balance. wbMin/wbMax/wbStep are the DEVICE's reported range, not
+    // constants — the UI binds the slider to them, so a camera with different
+    // limits gets the right control instead of a hardcoded one.
+    Q_PROPERTY(bool wbAuto MEMBER m_wbAuto NOTIFY whiteBalanceChanged)
+    Q_PROPERTY(int wbKelvin MEMBER m_wbKelvin NOTIFY whiteBalanceChanged)
+    Q_PROPERTY(int wbMin MEMBER m_wbMin NOTIFY whiteBalanceChanged)
+    Q_PROPERTY(int wbMax MEMBER m_wbMax NOTIFY whiteBalanceChanged)
+    Q_PROPERTY(int wbStep MEMBER m_wbStep NOTIFY whiteBalanceChanged)
 
     // ----- capability gating -----
     Q_PROPERTY(bool capAi READ capAi CONSTANT)
@@ -96,6 +104,9 @@ class CameraController : public QObject {
     Q_PROPERTY(bool capHdr READ capHdr NOTIFY imageChanged)   // dynamic: device reports hdr_support
     Q_PROPERTY(bool capTrackingAdvanced READ capTrackingAdvanced CONSTANT)
     Q_PROPERTY(QString capUnverifiedReason READ capUnverifiedReason CONSTANT)
+    // Runtime probe, not a constant: true once the camera answered
+    // cameraGetRangeWhiteBalanceR + cameraGetWhiteBalanceR on connect.
+    Q_PROPERTY(bool capWhiteBalance MEMBER m_capWhiteBalance NOTIFY whiteBalanceChanged)
 
     // ----- presets + external-preview fallback -----
     Q_PROPERTY(QVariantList presets READ presets NOTIFY presetsChanged)
@@ -293,6 +304,10 @@ public slots:
     void gestureQuietTest();          // 60 s SDK-traffic pause (gesture diagnostic)
     void setHdr(bool on);             // HDR/WDR on/off (only when capHdr)
     void setImageParam(const QString &param, int value);  // brightness/contrast/saturation/sharpness
+    // White balance. Kelvin is clamped to the DEVICE-reported range and snapped
+    // to its step, so the UI cannot ask for a value the camera would reject.
+    void setWhiteBalanceAuto(bool on);
+    void setWhiteBalanceKelvin(int kelvin);
     void rescan();
     void launchPreview();   // FALLBACK: (re)launch the external ffplay preview
     void stopPreview();     // terminate the ffplay preview (also called on shutdown)
@@ -355,6 +370,7 @@ signals:
     void zoomChanged();
     void aiChanged();
     void imageChanged();
+    void whiteBalanceChanged();
     void settingsChanged();
     void presetsChanged();
     void logLine(const QString &kind, const QString &message);
@@ -372,6 +388,7 @@ private slots:
     void onAuxStatus(bool faceFocus, bool hdrOn, bool hdrSupport, int fps, int sleepMicro, int autoSleepSec);
     void onZoomUpdate(double zoom, bool valid);
     void onImageParams(int brightness, int contrast, int saturation, int sharpness);
+    void onWhiteBalance(bool supported, bool autoMode, int kelvin, int kmin, int kmax, int kstep);
     void onWorkerResult(const QString &action, bool ok, int rc, const QString &message);
     void onPresetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
     void onMicStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning,
@@ -451,6 +468,14 @@ private:
 
     // Live image params (0–100), mirrored from the device on connect + on change.
     int m_brightness = 50, m_contrast = 50, m_saturation = 50, m_sharpness = 50;
+    // White balance. The range starts EMPTY on purpose: until the camera
+    // reports one, capWhiteBalance is false and the UI shows no slider, so
+    // there is never a moment where a plausible-looking but invented range is
+    // on screen.
+    bool m_capWhiteBalance = false;
+    bool m_wbAuto = true;
+    int m_wbKelvin = 0;
+    int m_wbMin = 0, m_wbMax = 0, m_wbStep = 100;
     int m_fps = 0;               // current video stream fps (from status)
     int m_micSleepDevice = -1;   // device-reported mic-during-sleep (readback; -1 unknown)
     int m_autoSleepDevice = -1;  // device-reported auto-sleep seconds (readback; -1 unknown, 0 never)
