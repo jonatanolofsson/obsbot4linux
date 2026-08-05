@@ -129,7 +129,12 @@ RowLayout {
 
     ColumnLayout {
         Layout.fillWidth: true
+        // Cap AND floor. The cap stops the controls sprawling on a wide display;
+        // the floor is what lets the preview take the rest without squeezing the
+        // sliders into uselessness — the failure mode that got the preview pinned
+        // to a fixed size in the first place.
         Layout.maximumWidth: 560
+        Layout.minimumWidth: 380
         Layout.alignment: Qt.AlignTop
         spacing: Theme.s3
 
@@ -243,11 +248,6 @@ RowLayout {
             }
         }
 
-    }
-
-    // reference preview — fixed size, roomy enough to judge image tweaks by
-    // (300x220 was too tiny; fill-the-page swallowed the controls — don't).
-    GlassPanel {
         // EXPOSURE COMPENSATION — live. The camera runs its own auto exposure;
         // this biases it. The SDK marks every exposure call "tail air", but a
         // Tiny 3 answers them, so the panel is gated on a runtime probe rather
@@ -294,10 +294,27 @@ RowLayout {
                 }
             }
         }
-        Layout.preferredWidth: 460
-        Layout.maximumWidth: 480
-        Layout.preferredHeight: 310
-        Layout.alignment: Qt.AlignTop
+    }
+
+    // Reference preview — takes ALL the space the controls do not.
+    //
+    // It was pinned to 460x310 because an earlier fill-the-page attempt swallowed
+    // the controls. The reason that happened is that both sides were free to
+    // grow, so the preview's demand ate the column. Fixing the SIZE was treating
+    // the symptom: the fix is a floor under the controls (minimumWidth below)
+    // and a cap over them (maximumWidth 560), after which the preview can take
+    // everything else safely — which is what you want when judging exposure and
+    // white balance, and why a fixed 460px window was frustrating on a large
+    // display.
+    //
+    // VideoOutput is PreserveAspectFit, so a panel wider or taller than 16:9
+    // letterboxes inside the viewfinder's own dark surface rather than
+    // distorting the image.
+    GlassPanel {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+        Layout.minimumWidth: 320
+        Layout.minimumHeight: 240
         ColumnLayout {
             anchors.fill: parent
             anchors.margins: 14
