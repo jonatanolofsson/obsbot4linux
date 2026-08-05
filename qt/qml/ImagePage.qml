@@ -18,6 +18,11 @@ RowLayout {
     id: root
     spacing: Theme.s4
 
+    // Grey-point white balance is ARMED, waiting for a click in the preview.
+    // Disarms on click, on completion, or if the preview stops — never left
+    // silently armed, which would make the next stray click move the picture.
+    property bool wbArmed: false
+
     // A live, coral-styled slider. Applies to the device on release (few SDK
     // calls), and reflects the device's current value via `boundValue`.
     component ImageSlider: RowLayout {
@@ -234,6 +239,27 @@ RowLayout {
                     pillWidth: 62
                     onApplied: (v) => cam.setWhiteBalanceKelvin(v)
                 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    ActionButton {
+                        text: root.wbArmed ? "Click a grey area…" : "Pick grey point"
+                        variant: root.wbArmed ? "primary" : "secondary"
+                        // Needs live frames: the pick samples the preview.
+                        enabled: cam.connected && preview.active && !cam.wbPicking
+                        onClicked: root.wbArmed = !root.wbArmed
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: cam.wbPicking ? cam.wbPickMessage
+                              : root.wbArmed ? "click something neutral \u2014 a wall, paper, a grey card"
+                              : !preview.active ? "start the preview to use this"
+                              : cam.wbPickMessage
+                        color: cam.wbPicking ? Theme.busy : Theme.dimmer
+                        font.family: Theme.mono; font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+                }
                 Text {
                     text: cam.wbAuto
                           ? "The camera is choosing the white balance. It does not report which "
@@ -320,7 +346,11 @@ RowLayout {
             anchors.margins: 14
             spacing: 8
             SectionLabel { text: "Reference" }
-            Viewfinder { Layout.fillWidth: true; Layout.fillHeight: true }
+            Viewfinder {
+                Layout.fillWidth: true; Layout.fillHeight: true
+                pickMode: root.wbArmed
+                onPicked: (nx, ny) => { root.wbArmed = false; cam.pickWhiteBalance(nx, ny) }
+            }
         }
     }
 }

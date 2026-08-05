@@ -20,6 +20,7 @@
 #include "Settings.h"
 
 class CameraWorker;
+class PreviewEngine;
 class QTimer;
 class QProcess;
 
@@ -113,6 +114,11 @@ class CameraController : public QObject {
     // Runtime probe: the camera answered the exposure getters. The SDK marks
     // these "tail air" but a Tiny 3 answers them — hence a probe, not a constant.
     Q_PROPERTY(bool capExposure MEMBER m_capExposure NOTIFY exposureChanged)
+    // Click-to-white-balance: a convergence run is in flight, and the last thing
+    // it has to say. The message is user-facing (why a pick was rejected, or
+    // where it landed), not a log line.
+    Q_PROPERTY(bool wbPicking MEMBER m_wbPicking NOTIFY wbPickChanged)
+    Q_PROPERTY(QString wbPickMessage MEMBER m_wbPickMessage NOTIFY wbPickChanged)
 
     // ----- presets + external-preview fallback -----
     Q_PROPERTY(QVariantList presets READ presets NOTIFY presetsChanged)
@@ -217,7 +223,10 @@ public:
     explicit CameraController(QObject *parent = nullptr);
     ~CameraController() override;
 
-    void start(int waitMs);   // begin discovery (called from main after QML loads)
+    void start(int waitMs);
+    // Wired in main.cpp. Only used for click-to-white-balance, which needs to
+    // read pixels; nothing else in the controller touches the preview.
+    void setPreviewEngine(PreviewEngine *p) { m_preview = p; }   // begin discovery (called from main after QML loads)
 
     // property getters
     int connState() const { return m_connState; }
@@ -316,6 +325,10 @@ public slots:
     void setWhiteBalanceKelvin(int kelvin);
     // ev is the DevAEEvBiasType index 0..18 (9 == 0 EV), clamped here.
     void setEvBias(int ev);
+    // Grey-point white balance. nx/ny are normalised coordinates INSIDE the
+    // video image. The camera takes only a Kelvin value, so this is a closed
+    // loop — sample, correct, re-measure — not a formula. See the .cpp.
+    void pickWhiteBalance(qreal nx, qreal ny);
     void rescan();
     void launchPreview();   // FALLBACK: (re)launch the external ffplay preview
     void stopPreview();     // terminate the ffplay preview (also called on shutdown)
@@ -380,6 +393,7 @@ signals:
     void imageChanged();
     void whiteBalanceChanged();
     void exposureChanged();
+    void wbPickChanged();
     void settingsChanged();
     void presetsChanged();
     void logLine(const QString &kind, const QString &message);
@@ -399,6 +413,9 @@ private slots:
     void onImageParams(int brightness, int contrast, int saturation, int sharpness);
     void onWhiteBalance(bool supported, bool autoMode, int kelvin, int kmin, int kmax, int kstep);
     void onExposureState(bool supported, int ev);
+    // One iteration of the grey-point loop: sample, decide, either converge or
+    // write the next temperature.
+    void wbPickStep();
     void onWorkerResult(const QString &action, bool ok, int rc, const QString &message);
     void onPresetCaptured(int idx, double pitch, double yaw, double zoom, int fov);
     void onMicStatus(bool tx1Online, bool tx2Online, bool twsMode, bool pairing, bool scanning,
@@ -482,6 +499,16 @@ private:
     // reports one, capWhiteBalance is false and the UI shows no slider, so
     // there is never a moment where a plausible-looking but invented range is
     // on screen.
+    // Click-to-WB state. m_wbPickTimer drives the loop; everything else is the
+    // run in progress.
+    QTimer *m_wbPickTimer = nullptr;
+    bool m_wbPicking = false;
+    QString m_wbPickMessage;
+    qreal m_wbPickX = 0.5, m_wbPickY = 0.5;
+    int m_wbPickTriesLeft = 0;
+    int m_wbPickKelvin = 0;
+    PreviewEngine *m_preview = nullptr;
+    void finishWbPick(const QString &message);
     bool m_capExposure = false;
     int m_evBias = 9;               // DevAEEvBias_0
     bool m_capWhiteBalance = false;

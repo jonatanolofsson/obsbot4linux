@@ -22,6 +22,16 @@ Rectangle {
 
     readonly property bool live: cam.connected && !cam.asleep
 
+    // Opt-in click target, used by the Image page's grey-point white balance.
+    // Off by default because this component is on three pages and a click
+    // should not mean anything on the other two.
+    property bool pickMode: false
+    // Normalised coordinates INSIDE THE VIDEO, not inside this item: the video
+    // is PreserveAspectFit, so it is letterboxed whenever the panel is not 16:9
+    // and a raw item coordinate would sample the wrong pixel — or the black
+    // bars. contentRect is the video's actual on-screen rectangle.
+    signal picked(real nx, real ny)
+
     // faint accent glow behind the (notional) subject — hidden once real video runs
     Rectangle {
         anchors.centerIn: parent
@@ -37,6 +47,20 @@ Rectangle {
         anchors.fill: parent
         fillMode: VideoOutput.PreserveAspectFit
         visible: preview.active
+    }
+    MouseArea {
+        anchors.fill: parent
+        enabled: root.pickMode && preview.active
+        visible: enabled
+        cursorShape: Qt.CrossCursor
+        onClicked: (mouse) => {
+            const c = vout.contentRect
+            if (c.width <= 0 || c.height <= 0) return
+            const nx = (mouse.x - c.x) / c.width
+            const ny = (mouse.y - c.y) / c.height
+            if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return   // clicked the letterbox
+            root.picked(nx, ny)
+        }
     }
     // Viewfinder is instantiated on THREE pages (Control / Image / Tracking) but
     // QMediaCaptureSession drives exactly ONE sink — so the instance that is

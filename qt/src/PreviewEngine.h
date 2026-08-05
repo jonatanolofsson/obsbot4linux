@@ -20,6 +20,7 @@
 
 #include <QMediaDevices>
 #include <QMutex>
+#include <QVariantMap>
 #include <QObject>
 #include <QPointer>
 #include <QThread>
@@ -76,6 +77,15 @@ public:
     ~PreviewEngine() override;
 
     bool available() const { return !m_devPath.isEmpty(); }
+    // Average colour of a small patch of the CURRENT frame, for
+    // click-to-white-balance. nx/ny are normalised (0..1) within the video
+    // image; frac is the patch size as a fraction of the shorter side.
+    // Returns { valid, r, g, b } with r/g/b in 0..255.
+    //
+    // Reads QVideoSink::videoFrame() rather than reaching into the capture
+    // thread: the sink already holds the last delivered frame and is safe to
+    // read from the GUI thread, so this needs no extra buffer or lock.
+    Q_INVOKABLE QVariantMap sampleRegion(qreal nx, qreal ny, qreal frac = 0.06) const;
     QString unavailableReason() const;
     bool active() const { return m_active; }
     QVideoSink *videoSink() const { return m_sink; }

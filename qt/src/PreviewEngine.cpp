@@ -6,6 +6,7 @@
 #include <QDir>
 #include <QImage>
 #include <QVideoFrame>
+#include <QVideoSink>
 
 #include <algorithm>
 #include <cerrno>
@@ -267,6 +268,46 @@ void PreviewEngine::setVideoSink(QVideoSink *sink) {
     if (m_thread)
         m_thread->setSink(sink);   // live re-target (page switch while streaming)
     emit videoSinkChanged();
+}
+
+// See the header for why this reads the sink rather than the capture thread.
+//
+// Deliberately reports SATURATION rather than silently averaging through it: a
+// patch containing blown-out pixels has lost the colour information the caller
+// wants, and averaging it yields a confidently neutral answer that is simply
+// wrong. Callers treat valid=false as "pick somewhere else", not as an error.
+QVariantMap PreviewEngine::sampleRegion(qreal nx, qreal ny, qreal frac) const {
+    QVariantMap out;
+    out["valid"] = false;
+    QVideoSink *sink = m_sink.data();
+    if (!sink) { out["reason"] = QStringLiteral("no preview running"); return out; }
+    const QImage img = sink->videoFrame().toImage();
+    if (img.isNull()) { out["reason"] = QStringLiteral("no frame available"); return out; }
+
+    const int side = qMax(4, int(qMin(img.width(), img.height()) * qBound(0.01, double(frac), 0.5)));
+    const int cx = qBound(0, int(nx * img.width()), img.width() - 1);
+    const int cy = qBound(0, int(ny * img.height()), img.height() - 1);
+    const int x0 = qBound(0, cx - side / 2, img.width() - 1);
+    const int y0 = qBound(0, cy - side / 2, img.height() - 1);
+    const int x1 = qBound(0, x0 + side, img.width());
+    const int y1 = qBound(0, y0 + side, img.height());
+
+    quint64 rs = 0, gs = 0, bs = 0, n = 0, hot = 0;
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            const QRgb p = img.pixel(x, y);
+            const int r = qRed(p), g = qGreen(p), b = qBlue(p);
+            if (r >= 250 || g >= 250 || b >= 250) ++hot;
+            rs += quint64(r); gs += quint64(g); bs += quint64(b); ++n;
+        }
+    }
+    if (n == 0) { out["reason"] = QStringLiteral("empty sample"); return out; }
+    const double r = double(rs) / n, g = double(gs) / n, b = double(bs) / n;
+    if (hot * 4 > n) { out["reason"] = QStringLiteral("that area is blown out — pick a darker grey"); return out; }
+    if (r + g + b < 60)  { out["reason"] = QStringLiteral("that area is too dark to read a colour from"); return out; }
+    out["valid"] = true;
+    out["r"] = r; out["g"] = g; out["b"] = b;
+    return out;
 }
 
 void PreviewEngine::refreshDevice() {

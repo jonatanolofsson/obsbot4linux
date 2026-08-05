@@ -119,6 +119,10 @@ int main(int argc, char **argv) {
     QObject::connect(&audioMeter, &AudioMeter::logLine,
                      &controller, &CameraController::logLine);
 
+    // Click-to-white-balance samples pixels, so the controller needs the
+    // preview. Nothing else in the controller touches it.
+    controller.setPreviewEngine(&preview);
+
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("cam", &controller);
     engine.rootContext()->setContextProperty("preview", &preview);

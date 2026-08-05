@@ -1,5 +1,6 @@
 #include "CameraController.h"
 #include "CameraWorker.h"
+#include "PreviewEngine.h"
 #include "ObsbotVideoNode.h"
 #include "PreviewFormats.h"
 
@@ -9,6 +10,8 @@
 #include <QProcess>
 #include <QStandardPaths>
 #include <QTimer>
+
+#include <cmath>
 
 namespace {
 // Mirror of the SDK's AiWorkModeType values we use (see dev.hpp:554). Kept as
@@ -1208,6 +1211,123 @@ void CameraController::setEvBias(int ev) {
     }
     const int v = ev < 0 ? 0 : (ev > 18 ? 18 : ev);
     QMetaObject::invokeMethod(m_worker, "cmdSetEvBias", Qt::QueuedConnection, Q_ARG(int, v));
+}
+
+// ---------------------------------------------------------------------------
+// GREY-POINT WHITE BALANCE
+//
+// Click something that should be neutral; the app finds the Kelvin value that
+// makes it neutral. The camera has no native support for this — DevWhiteBalance
+// Area exists as a mode value but the SDK exposes no way to say WHERE the area
+// is, and cameraSetRoiTarget is a framing ROI, not metering. So it is done here.
+//
+// A CLOSED LOOP, not a formula. The camera accepts only a colour temperature,
+// and the mapping from Kelvin to the resulting colour cast depends on the light
+// in the room. Measured on a Tiny 3: 3000 K gave B/R 2.152, 6000 K gave 0.915,
+// 9000 K gave 0.658 — monotonic, and close to B/R being inversely proportional
+// to Kelvin, which is what the first step below assumes. Iterating then corrects
+// whatever that first guess got wrong, so the scene decides, not this constant.
+//
+// Only the warm-cool axis can be corrected. One Kelvin value cannot express a
+// green or magenta cast, and the Tiny 3 has no tint control, so under
+// fluorescent light this gets as close as the hardware allows and stops.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kWbPickTries = 6;
+constexpr int kWbPickSettleMs = 700;   // write + camera settle + readback
+// Stop when the patch is this close to neutral. |ln(B/R)| < 0.035 is about 3.5%,
+// which is below what the eye reads as a cast and well inside frame-to-frame
+// noise — chasing further would just oscillate.
+constexpr double kWbPickTol = 0.035;
+} // namespace
+
+void CameraController::pickWhiteBalance(qreal nx, qreal ny) {
+    if (!connected() || !m_capWhiteBalance) {
+        m_wbPickMessage = QStringLiteral("white balance is not available on this camera");
+        emit wbPickChanged();
+        return;
+    }
+    if (!m_preview) {
+        m_wbPickMessage = QStringLiteral("no preview to sample");
+        emit wbPickChanged();
+        return;
+    }
+    m_wbPickX = nx;
+    m_wbPickY = ny;
+    m_wbPickTriesLeft = kWbPickTries;
+    // Start from where the camera is now if that is a real manual value;
+    // otherwise from the middle of the range, since in auto the reported number
+    // is a stored setting rather than what the camera is using.
+    m_wbPickKelvin = (!m_wbAuto && m_wbKelvin >= m_wbMin && m_wbKelvin <= m_wbMax)
+                         ? m_wbKelvin : (m_wbMin + m_wbMax) / 2;
+    m_wbPicking = true;
+    m_wbPickMessage = QStringLiteral("measuring…");
+    emit wbPickChanged();
+
+    if (!m_wbPickTimer) {
+        m_wbPickTimer = new QTimer(this);
+        m_wbPickTimer->setInterval(kWbPickSettleMs);
+        connect(m_wbPickTimer, &QTimer::timeout, this, &CameraController::wbPickStep);
+    }
+    // Leaving auto is part of the operation: a grey-point pick only means
+    // anything as a manual setting.
+    QMetaObject::invokeMethod(m_worker, "cmdSetWhiteBalance", Qt::QueuedConnection,
+                              Q_ARG(bool, false), Q_ARG(int, m_wbPickKelvin));
+    m_wbPickTimer->start();
+}
+
+void CameraController::wbPickStep() {
+    if (!m_preview || !connected()) { finishWbPick(QStringLiteral("preview stopped")); return; }
+    const QVariantMap s = m_preview->sampleRegion(m_wbPickX, m_wbPickY);
+    if (!s.value("valid").toBool()) {
+        finishWbPick(s.value("reason", QStringLiteral("could not sample that area")).toString());
+        return;
+    }
+    const double r = s.value("r").toDouble(), b = s.value("b").toDouble();
+    if (r <= 1.0 || b <= 1.0) { finishWbPick(QStringLiteral("that area is too dark")); return; }
+
+    const double ratio = b / r;                 // >1 means too blue, <1 too warm
+    const double err = std::log(ratio);
+    if (std::fabs(err) < kWbPickTol) {
+        finishWbPick(QStringLiteral("neutral at %1 K").arg(m_wbPickKelvin));
+        return;
+    }
+    if (--m_wbPickTriesLeft <= 0) {
+        finishWbPick(QStringLiteral("closest possible: %1 K (residual cast is green/magenta, "
+                                    "which one temperature cannot fix)").arg(m_wbPickKelvin));
+        return;
+    }
+
+    // B/R falls as Kelvin rises, roughly as 1/K, so multiplying the temperature
+    // by the measured ratio moves it toward neutral. Damped because the
+    // relationship is only approximately 1/K and overshooting wastes an
+    // iteration — each one costs the settle delay.
+    const int step = m_wbStep > 0 ? m_wbStep : 100;
+    int next = int(std::lround(m_wbPickKelvin * std::pow(ratio, 0.85)));
+    next = qBound(m_wbMin, next, m_wbMax);
+    next = m_wbMin + ((next - m_wbMin + step / 2) / step) * step;
+    next = qBound(m_wbMin, next, m_wbMax);
+    if (next == m_wbPickKelvin) {
+        // Already at the end of the range, or the step is coarser than the
+        // remaining error — either way there is nothing further to try.
+        finishWbPick(m_wbPickKelvin <= m_wbMin || m_wbPickKelvin >= m_wbMax
+                         ? QStringLiteral("hit the camera's %1 K limit").arg(m_wbPickKelvin)
+                         : QStringLiteral("closest possible: %1 K").arg(m_wbPickKelvin));
+        return;
+    }
+    m_wbPickKelvin = next;
+    m_wbPickMessage = QStringLiteral("measuring… %1 K").arg(next);
+    emit wbPickChanged();
+    QMetaObject::invokeMethod(m_worker, "cmdSetWhiteBalance", Qt::QueuedConnection,
+                              Q_ARG(bool, false), Q_ARG(int, next));
+}
+
+void CameraController::finishWbPick(const QString &message) {
+    if (m_wbPickTimer) m_wbPickTimer->stop();
+    m_wbPicking = false;
+    m_wbPickMessage = message;
+    emit logLine("sys", QStringLiteral("grey-point white balance: %1").arg(message));
+    emit wbPickChanged();
 }
 
 void CameraController::onZoomUpdate(double zoom, bool valid) {
